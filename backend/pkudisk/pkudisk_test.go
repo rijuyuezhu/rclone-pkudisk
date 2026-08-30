@@ -22,7 +22,7 @@ func TestListVirtualRootAndDirectory(t *testing.T) {
 		switch r.URL.Path {
 		case "/api/efast/v1/entry-doc-lib":
 			_ = json.NewEncoder(w).Encode([]map[string]any{{
-				"id": "gns://personal", "name": "Personal", "type": "user_doc_lib", "modified_at": "2026-08-30T00:00:00Z",
+				"id": "gns://personal", "name": "Personal：Library", "type": "user_doc_lib", "modified_at": "2026-08-30T00:00:00Z",
 			}})
 		case "/api/efast/v1/dir/list":
 			var body map[string]any
@@ -32,8 +32,11 @@ func TestListVirtualRootAndDirectory(t *testing.T) {
 				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"dirs":  []map[string]any{{"docid": "gns://personal/dir", "name": "docs", "size": -1, "modified": int64(1_788_000_000_000_000)}},
-				"files": []map[string]any{{"docid": "gns://personal/file", "name": "hello.txt", "size": 5, "modified": int64(1_788_000_001_000_000), "rev": "rev-1"}},
+				"dirs": []map[string]any{{"docid": "gns://personal/dir", "name": "docs", "size": -1, "modified": int64(1_788_000_000_000_000)}},
+				"files": []map[string]any{{
+					"docid": "gns://personal/file", "name": "hello.txt", "size": 5,
+					"modified": int64(1_788_000_001_000_000), "client_mtime": int64(1_577_934_245_123_456), "rev": "rev-1",
+				}},
 			})
 		default:
 			http.NotFound(w, r)
@@ -45,6 +48,7 @@ func TestListVirtualRootAndDirectory(t *testing.T) {
 		"auth":         "token",
 		"access_token": "test-token",
 		"base_url":     server.URL,
+		"encoding":     defaultEncoding.String(),
 	}
 	backend, err := NewFs(context.Background(), "pku", "", m)
 	if err != nil {
@@ -55,10 +59,10 @@ func TestListVirtualRootAndDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(root) != 1 || root[0].Remote() != "Personal" {
+	if len(root) != 1 || root[0].Remote() != "Personal：Library" {
 		t.Fatalf("root listing = %#v", root)
 	}
-	entries, err := f.List(context.Background(), "Personal")
+	entries, err := f.List(context.Background(), "Personal：Library")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,11 +75,11 @@ func TestListVirtualRootAndDirectory(t *testing.T) {
 			file = object
 		}
 	}
-	if file == nil || file.Remote() != "Personal/hello.txt" || file.Size() != 5 {
+	if file == nil || file.Remote() != "Personal：Library/hello.txt" || file.Size() != 5 {
 		t.Fatalf("file entry = %#v", file)
 	}
-	want := time.Unix(0, 1_788_000_001_000_000*int64(time.Microsecond)).UTC()
+	want := time.Unix(0, 1_577_934_245_123_456*int64(time.Microsecond)).UTC()
 	if !file.ModTime(context.Background()).Equal(want) {
-		t.Fatalf("modtime = %s, want %s", file.ModTime(context.Background()), want)
+		t.Fatalf("modtime = %s, want client_mtime %s", file.ModTime(context.Background()), want)
 	}
 }

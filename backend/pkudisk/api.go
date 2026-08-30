@@ -15,12 +15,23 @@ import (
 
 const defaultBaseURL = "https://disk.pku.edu.cn"
 
-var expiredTokenCodes = map[int64]struct{}{
+var reauthenticationCodes = map[int64]struct{}{
+	// These codes have been observed in the PKU AnyShare client / bridge as
+	// states where the current bearer session should be reacquired once. Some
+	// are policy failures rather than literal expiry; retrying once is useful
+	// for auth=pkudist because the official client may already have rotated its
+	// token, and remains harmless for OAuth before returning the original error.
 	401001001: {},
 	401001002: {},
 	401001003: {},
 	401001004: {},
 	401001005: {},
+	401001011: {},
+	401001025: {},
+	401001031: {},
+	401001033: {},
+	401001036: {},
+	401001051: {},
 }
 
 type apiClient struct {
@@ -37,11 +48,12 @@ type library struct {
 }
 
 type entry struct {
-	DocID    string `json:"docid"`
-	Name     string `json:"name"`
-	Size     int64  `json:"size"`
-	Modified int64  `json:"modified"`
-	Rev      string `json:"rev"`
+	DocID       string `json:"docid"`
+	Name        string `json:"name"`
+	Size        int64  `json:"size"`
+	Modified    int64  `json:"modified"`
+	ClientMTime int64  `json:"client_mtime"`
+	Rev         string `json:"rev"`
 }
 
 type directoryListing struct {
@@ -50,13 +62,14 @@ type directoryListing struct {
 }
 
 type fileMetadata struct {
-	DocID      string `json:"docid"`
-	Name       string `json:"file_name"`
-	NameAlt    string `json:"name"`
-	Size       int64  `json:"size"`
-	Modified   int64  `json:"modified"`
-	Rev        string `json:"rev"`
-	DocLibType string `json:"doc_lib_type"`
+	DocID       string `json:"docid"`
+	Name        string `json:"file_name"`
+	NameAlt     string `json:"name"`
+	Size        int64  `json:"size"`
+	Modified    int64  `json:"modified"`
+	ClientMTime int64  `json:"client_mtime"`
+	Rev         string `json:"rev"`
+	DocLibType  string `json:"doc_lib_type"`
 }
 
 func (m fileMetadata) fileName() string {
@@ -225,7 +238,7 @@ func isAuthError(err error) bool {
 	if apiErr.Status == http.StatusUnauthorized {
 		return true
 	}
-	_, ok := expiredTokenCodes[apiErr.Code]
+	_, ok := reauthenticationCodes[apiErr.Code]
 	return ok
 }
 
@@ -357,4 +370,11 @@ func parseModifiedMicros(micros int64) time.Time {
 		return time.Time{}
 	}
 	return time.Unix(0, micros*int64(time.Microsecond)).UTC()
+}
+
+func fileModTime(clientMTime, modified int64) time.Time {
+	if clientMTime > 0 {
+		return parseModifiedMicros(clientMTime)
+	}
+	return parseModifiedMicros(modified)
 }

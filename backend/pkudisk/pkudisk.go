@@ -13,14 +13,28 @@ import (
 	"time"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/dircache"
+	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/oauthutil"
 )
 
-const virtualRootID = "pkudisk://root"
+const (
+	virtualRootID   = "pkudisk://root"
+	defaultEncoding = encoder.EncodeCtl |
+		encoder.EncodeDel |
+		encoder.EncodeDot |
+		encoder.EncodeSlash |
+		encoder.EncodeBackSlash |
+		encoder.EncodeWin |
+		encoder.EncodeLeftSpace |
+		encoder.EncodeRightSpace |
+		encoder.EncodeRightPeriod |
+		encoder.EncodeInvalidUtf8
+)
 
 func init() {
 	fs.Register(&fs.RegInfo{
@@ -72,18 +86,25 @@ func init() {
 				Help: "AnyShare OAuth device identifier.",
 				Hide: fs.OptionHideBoth,
 			},
+			{
+				Name:     config.ConfigEncoding,
+				Help:     config.ConfigEncodingHelp,
+				Advanced: true,
+				Default:  defaultEncoding,
+			},
 		},
 	})
 }
 
 type Options struct {
-	Auth              string `config:"auth"`
-	AccessToken       string `config:"access_token"`
-	PkudistLevelDB    string `config:"pkudist_leveldb"`
-	BaseURL           string `config:"base_url"`
-	OAuthClientID     string `config:"oauth_client_id"`
-	OAuthClientSecret string `config:"oauth_client_secret"`
-	OAuthUDID         string `config:"oauth_udid"`
+	Auth              string               `config:"auth"`
+	AccessToken       string               `config:"access_token"`
+	PkudistLevelDB    string               `config:"pkudist_leveldb"`
+	BaseURL           string               `config:"base_url"`
+	OAuthClientID     string               `config:"oauth_client_id"`
+	OAuthClientSecret string               `config:"oauth_client_secret"`
+	OAuthUDID         string               `config:"oauth_udid"`
+	Enc               encoder.MultiEncoder `config:"encoding"`
 }
 
 type Fs struct {
@@ -175,6 +196,9 @@ func (f *Fs) Features() *fs.Features   { return f.features }
 func (f *Fs) Precision() time.Duration { return time.Microsecond }
 func (f *Fs) Hashes() hash.Set         { return hash.Set(hash.None) }
 
+func (f *Fs) encodeName(name string) string { return f.opt.Enc.FromStandardName(name) }
+func (f *Fs) decodeName(name string) string { return f.opt.Enc.ToStandardName(name) }
+
 func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (string, bool, error) {
 	if pathID == virtualRootID {
 		libs, err := f.api.libraries(ctx)
@@ -193,7 +217,7 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (string, bool, e
 		return "", false, err
 	}
 	for _, item := range listing.Dirs {
-		if item.Name == leaf {
+		if f.decodeName(item.Name) == leaf {
 			return item.DocID, true, nil
 		}
 	}
@@ -204,7 +228,7 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (string, error)
 	if pathID == virtualRootID {
 		return "", errors.New("PKU Disk document libraries cannot be created through the file API")
 	}
-	return f.api.createDir(ctx, pathID, leaf)
+	return f.api.createDir(ctx, pathID, f.encodeName(leaf))
 }
 
 func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
@@ -232,12 +256,12 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 		return nil, err
 	}
 	for _, item := range listing.Dirs {
-		remote := path.Join(dir, item.Name)
+		remote := path.Join(dir, f.decodeName(item.Name))
 		entries = append(entries, fs.NewDir(remote, parseModifiedMicros(item.Modified)).SetID(item.DocID))
 		f.dirCache.Put(remote, item.DocID)
 	}
 	for _, item := range listing.Files {
-		entries = append(entries, f.objectFromEntry(path.Join(dir, item.Name), item))
+		entries = append(entries, f.objectFromEntry(path.Join(dir, f.decodeName(item.Name)), item))
 	}
 	return entries, nil
 }
@@ -248,7 +272,7 @@ func (f *Fs) objectFromEntry(remote string, item entry) *Object {
 		remote:  remote,
 		id:      item.DocID,
 		size:    item.Size,
-		modTime: parseModifiedMicros(item.Modified),
+		modTime: fileModTime(item.ClientMTime, item.Modified),
 		rev:     item.Rev,
 	}
 }
@@ -264,12 +288,12 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		return nil, err
 	}
 	for _, item := range listing.Files {
-		if item.Name == leaf {
+		if f.decodeName(item.Name) == leaf {
 			return f.objectFromEntry(remote, item), nil
 		}
 	}
 	for _, item := range listing.Dirs {
-		if item.Name == leaf {
+		if f.decodeName(item.Name) == leaf {
 			return nil, fs.ErrorIsDir
 		}
 	}
@@ -277,7 +301,17 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 }
 
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	o := &Object{fs: f, remote: src.Remote()}
+	remote := src.Remote()
+	if existing, err := f.NewObject(ctx, remote); err == nil {
+		if err := existing.Update(ctx, in, src, options...); err != nil {
+			return nil, err
+		}
+		return existing, nil
+	} else if !errors.Is(err, fs.ErrorObjectNotFound) {
+		return nil, err
+	}
+
+	o := &Object{fs: f, remote: remote}
 	if err := o.Update(ctx, in, src, options...); err != nil {
 		return nil, err
 	}
@@ -285,9 +319,6 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 }
 
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
-	if dir == "" {
-		return nil
-	}
 	_, err := f.dirCache.FindDir(ctx, dir, true)
 	return err
 }
@@ -341,15 +372,8 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	if err != nil {
 		return nil, err
 	}
-	if srcParentID != dstParentID {
-		if err := f.api.moveEntry(ctx, source.id, dstParentID, false); err != nil {
-			return nil, err
-		}
-	}
-	if srcLeaf != dstLeaf {
-		if err := f.api.renameEntry(ctx, source.id, dstLeaf, false); err != nil {
-			return nil, err
-		}
+	if _, err := f.relocateEntry(ctx, source.id, srcParentID, dstParentID, srcLeaf, dstLeaf, false, fs.ErrorCantMove); err != nil {
+		return nil, err
 	}
 	return f.NewObject(ctx, remote)
 }
@@ -359,43 +383,135 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	if !ok || source.name != f.name {
 		return fs.ErrorCantDirMove
 	}
-	if dstRemote == "" {
-		return fs.ErrorDirExists
+	if (srcRemote == "" && source.root == "") || (dstRemote == "" && f.root == "") {
+		return fs.ErrorCantDirMove
 	}
-	if _, err := f.dirCache.FindDir(ctx, dstRemote, false); err == nil {
-		return fs.ErrorDirExists
-	}
-	srcID, err := source.dirCache.FindDir(ctx, srcRemote, false)
-	if err != nil || srcID == virtualRootID {
-		return fs.ErrorDirNotFound
-	}
-	dstParent, dstLeaf := dircache.SplitPath(dstRemote)
-	dstParentID, err := f.dirCache.FindDir(ctx, dstParent, true)
+
+	srcID, srcParentID, srcLeaf, dstParentID, dstLeaf, err := f.dirCache.DirMove(
+		ctx, source.dirCache, source.root, srcRemote, f.root, dstRemote,
+	)
 	if err != nil {
 		return err
 	}
-	srcParent, srcLeaf := dircache.SplitPath(srcRemote)
-	srcParentID, err := source.dirCache.FindDir(ctx, srcParent, false)
-	if err != nil {
+	if srcParentID == virtualRootID || dstParentID == virtualRootID {
+		return fs.ErrorCantDirMove
+	}
+	if _, err := f.relocateEntry(ctx, srcID, srcParentID, dstParentID, srcLeaf, dstLeaf, true, fs.ErrorCantDirMove); err != nil {
 		return err
-	}
-	if srcParentID != dstParentID {
-		if err := f.api.moveEntry(ctx, srcID, dstParentID, true); err != nil {
-			return err
-		}
-	}
-	if srcLeaf != dstLeaf {
-		if err := f.api.renameEntry(ctx, srcID, dstLeaf, true); err != nil {
-			return err
-		}
 	}
 	source.dirCache.FlushDir(srcRemote)
 	f.dirCache.FlushDir(dstRemote)
 	return nil
 }
 
-func (o *Object) Fs() fs.Info                       { return o.fs }
-func (o *Object) String() string                    { return o.remote }
+func (f *Fs) relocateEntry(ctx context.Context, id, srcParentID, dstParentID, srcLeaf, dstLeaf string, isDir bool, cantMove error) (string, error) {
+	if srcParentID == dstParentID {
+		if srcLeaf == dstLeaf {
+			return id, nil
+		}
+		if err := f.api.renameEntry(ctx, id, f.encodeName(dstLeaf), isDir); err != nil {
+			return "", err
+		}
+		return f.resolveChildID(ctx, srcParentID, dstLeaf, isDir)
+	}
+
+	if srcLeaf == dstLeaf {
+		if err := f.api.moveEntry(ctx, id, dstParentID, isDir); err != nil {
+			return "", err
+		}
+		return f.resolveChildID(ctx, dstParentID, dstLeaf, isDir)
+	}
+
+	dstHasSourceName, err := f.childExists(ctx, dstParentID, srcLeaf, isDir)
+	if err != nil {
+		return "", err
+	}
+	if !dstHasSourceName {
+		if err := f.api.moveEntry(ctx, id, dstParentID, isDir); err != nil {
+			return "", err
+		}
+		movedID, err := f.resolveChildID(ctx, dstParentID, srcLeaf, isDir)
+		if err != nil {
+			return "", err
+		}
+		if err := f.api.renameEntry(ctx, movedID, f.encodeName(dstLeaf), isDir); err != nil {
+			return "", err
+		}
+		return f.resolveChildID(ctx, dstParentID, dstLeaf, isDir)
+	}
+
+	// Moving first would collide with an existing destination entry that has
+	// the source name. Rename first if that intermediate name is free in the
+	// source directory. If both intermediate names collide, let rclone fall
+	// back instead of leaving a partially renamed server-side object.
+	srcHasDestinationName, err := f.childExists(ctx, srcParentID, dstLeaf, isDir)
+	if err != nil {
+		return "", err
+	}
+	if srcHasDestinationName {
+		return "", cantMove
+	}
+	if err := f.api.renameEntry(ctx, id, f.encodeName(dstLeaf), isDir); err != nil {
+		return "", err
+	}
+	renamedID, err := f.resolveChildID(ctx, srcParentID, dstLeaf, isDir)
+	if err != nil {
+		return "", err
+	}
+	if err := f.api.moveEntry(ctx, renamedID, dstParentID, isDir); err != nil {
+		// Best-effort rollback: keep the source path stable when the second
+		// server-side operation fails.
+		_ = f.api.renameEntry(ctx, renamedID, f.encodeName(srcLeaf), isDir)
+		return "", err
+	}
+	return f.resolveChildID(ctx, dstParentID, dstLeaf, isDir)
+}
+
+func (f *Fs) childExists(ctx context.Context, parentID, leaf string, isDir bool) (bool, error) {
+	listing, err := f.api.listDir(ctx, parentID)
+	if err != nil {
+		return false, err
+	}
+	entries := listing.Files
+	if isDir {
+		entries = listing.Dirs
+	}
+	for _, item := range entries {
+		if f.decodeName(item.Name) == leaf {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (f *Fs) resolveChildID(ctx context.Context, parentID, leaf string, isDir bool) (string, error) {
+	listing, err := f.api.listDir(ctx, parentID)
+	if err != nil {
+		return "", err
+	}
+	entries := listing.Files
+	if isDir {
+		entries = listing.Dirs
+	}
+	for _, item := range entries {
+		if f.decodeName(item.Name) == leaf {
+			return item.DocID, nil
+		}
+	}
+	kind := "file"
+	if isDir {
+		kind = "directory"
+	}
+	return "", fmt.Errorf("moved PKU Disk %s %q could not be resolved in destination", kind, leaf)
+}
+
+func (o *Object) Fs() fs.Info { return o.fs }
+func (o *Object) String() string {
+	if o == nil {
+		return "<nil>"
+	}
+	return o.remote
+}
 func (o *Object) Remote() string                    { return o.remote }
 func (o *Object) ModTime(context.Context) time.Time { return o.modTime }
 func (o *Object) Size() int64                       { return o.size }
@@ -412,11 +528,11 @@ func (o *Object) SetModTime(context.Context, time.Time) error {
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 	meta := fileMetadata{
 		DocID: o.id,
-		Name:  o.remote,
+		Name:  o.fs.encodeName(path.Base(o.remote)),
 		Size:  o.size,
 		Rev:   o.rev,
 	}
-	if meta.Rev == "" || path.Base(meta.Name) == "" {
+	if meta.Rev == "" || meta.Name == "" {
 		fresh, err := o.fs.api.metadata(ctx, o.id)
 		if err != nil {
 			return nil, err
@@ -461,14 +577,14 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ 
 	if parentID == virtualRootID {
 		return errors.New("files cannot be uploaded directly into the PKU Disk virtual root")
 	}
-	meta, err := o.fs.api.upload(ctx, parentID, leaf, o.id, o.rev, src.Size(), src.ModTime(ctx), in)
+	meta, err := o.fs.api.upload(ctx, parentID, o.fs.encodeName(leaf), o.id, o.rev, src.Size(), src.ModTime(ctx), in)
 	if err != nil {
 		return err
 	}
 	o.id = meta.DocID
 	o.size = meta.Size
 	o.rev = meta.Rev
-	o.modTime = parseModifiedMicros(meta.Modified)
+	o.modTime = fileModTime(meta.ClientMTime, meta.Modified)
 	if o.modTime.IsZero() {
 		o.modTime = src.ModTime(ctx)
 	}
