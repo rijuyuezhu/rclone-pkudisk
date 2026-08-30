@@ -2,6 +2,7 @@
 _junk/
 /rclone
 /rclone.exe
+/bin/
 /rclone_out_of_tree_example
 build
 /docs/public/
