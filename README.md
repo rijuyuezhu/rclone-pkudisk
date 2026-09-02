@@ -1,186 +1,241 @@
 # rclone-pkudisk
 
-`rclone-pkudisk` is an out-of-tree [rclone](https://rclone.org/) backend for Peking University PKU Disk, backed by the AnyShare 7 APIs used by `disk.pku.edu.cn`.
+`rclone-pkudisk` is an unofficial [rclone](https://rclone.org/) backend for Peking University PKU Disk (`disk.pku.edu.cn`), implemented against the AnyShare 7 APIs used by the service.
 
-The repository builds a small rclone executable with the `pkudisk` backend included. It is intended for normal rclone CLI usage and for long-running sync frontends such as Mt Sync.
+It builds a standalone rclone executable with the `pkudisk` backend included. A separate system `rclone` installation is not required.
 
-## Status
+> [!IMPORTANT]
+> This project is not affiliated with or supported by Peking University or AISHU/AnyShare. It relies on service APIs that may change without notice.
 
-The backend currently supports the operations needed for ordinary filesystem synchronization:
+## Features
+
+The backend currently supports the operations needed for ordinary file transfer and local-to-PKU backup workflows:
 
 - list document libraries, directories, and files
 - create and remove directories
 - upload new files and update existing files as AnyShare revisions
-- small signed uploads and multipart uploads
-- download and range reads
+- signed single uploads and multipart uploads
+- downloads and ranged reads
 - remove files
-- server-side file moves and directory moves
+- server-side file and directory moves
 - reversible filename encoding for names AnyShare rejects or normalizes
-- microsecond file modification times through AnyShare `client_mtime`
-- OAuth token refresh
+- source modification times through AnyShare `client_mtime`
+- OAuth login and refresh independent of the official desktop client
 
-It has been exercised against a live PKU Disk account with rclone's backend contracts for filename encoding, overwrite/update, range reads, file moves, rooted directory moves, empty files, removal, and common error paths.
+The backend has been exercised against a live PKU Disk account with large directory trees and repeated incremental `rclone copy` runs.
 
-## Build
+## Installation
 
-Requirements:
+### Install with Go
 
-- Go 1.25 or newer
+Go 1.25 or newer is required.
 
-Build the executable:
+Once the repository is published, install the latest version with:
 
 ```bash
+go install github.com/rijuyuezhu/rclone-pkudisk@latest
+```
+
+The binary is installed as `rclone-pkudisk` under `GOBIN`, or under `$(go env GOPATH)/bin` when `GOBIN` is unset.
+
+### Build from source
+
+```bash
+git clone https://github.com/rijuyuezhu/rclone-pkudisk.git
+cd rclone-pkudisk
 go build -o bin/rclone-pkudisk .
 ```
 
-Check the backend is present:
+Optionally install it into your user PATH:
 
 ```bash
-./bin/rclone-pkudisk help backend pkudisk
+install -Dm755 bin/rclone-pkudisk ~/.local/bin/rclone-pkudisk
 ```
 
-Run the local test suite:
+Check that the backend is available:
 
 ```bash
-go test ./...
-go vet ./...
+rclone-pkudisk help backend pkudisk
 ```
 
-## Configure
+## Configuration
 
 Run the normal rclone configuration UI:
 
 ```bash
-./bin/rclone-pkudisk config
+rclone-pkudisk config
 ```
 
-Create a remote and select `pkudisk` as its storage type.
+Create a new remote, for example `pku`, and select `pkudisk` as the storage type. The default service endpoint is `https://disk.pku.edu.cn`.
 
 ### OAuth — recommended
 
-Use `auth = oauth` for Mt Sync, mounts, scheduled synchronization, and other long-running jobs.
+Use the default `auth = oauth` mode for normal use, especially scheduled or unattended jobs.
 
-The backend dynamically registers an AnyShare OAuth client and stores the resulting rclone OAuth configuration. Access-token refresh is then independent of the official PKU Disk desktop client.
+The backend dynamically registers an AnyShare OAuth client, opens the normal authorization flow, and stores the resulting OAuth state in the rclone configuration. Refreshing credentials does not depend on the official PKU Disk desktop client being open.
 
-### Reuse the official desktop client
+After configuration, verify access with:
 
-`auth = pkudist` reads the signed-in AnyShare desktop client's Chromium LevelDB without modifying it. On Linux the default location is:
+```bash
+rclone-pkudisk lsd pku:
+```
+
+### Reuse the official Linux client
+
+`auth = pkudist` can reuse the signed-in official PKU Disk desktop client's token. On Linux the default Chromium Local Storage database is:
 
 ```text
 ~/.config/AnyShare/Local Storage/leveldb
 ```
 
-The backend understands Chromium LevelDB WAL records as well as table files, because the latest OAuth token may exist only in the active WAL.
+The database is read only; `rclone-pkudisk` does not modify the official client's profile.
 
-This mode is useful for temporary CLI access, but it is not recommended for a long-running sync process: if the desktop client itself has not refreshed an expired token yet, rereading its profile still returns that expired token.
+This mode is useful for temporary CLI access, but OAuth is a better choice for unattended jobs because token refresh in `pkudist` mode still depends on the official client having refreshed its own session.
 
 ### Explicit token
 
-`auth = token` accepts an explicit access token. It is mainly useful for debugging and controlled environments.
+`auth = token` accepts an explicit access token. It is intended mainly for debugging and controlled environments.
 
-## Remote layout
+## PKU Disk layout
 
-The backend exposes a virtual root. Each PKU Disk document library appears as a top-level directory:
+The backend exposes a virtual root where each PKU Disk document library is a top-level directory:
 
 ```text
-remote:
+pku:
 ├── <document-library-1>/
 └── <document-library-2>/
 ```
 
-Document libraries themselves cannot be created or deleted through the file API, and files cannot be uploaded directly into the virtual root.
-
-Typical commands therefore target a document library or a directory below it:
+Document libraries themselves cannot be created or removed through the normal file API, and files cannot be uploaded directly into the virtual root. Select a document library first:
 
 ```bash
-./bin/rclone-pkudisk lsd pku:
-./bin/rclone-pkudisk ls 'pku:<document-library>/'
-./bin/rclone-pkudisk copy ./local-dir 'pku:<document-library>/backup'
-./bin/rclone-pkudisk sync ./local-dir 'pku:<document-library>/sync-root'
+rclone-pkudisk lsd pku:
+rclone-pkudisk ls 'pku:<document-library>/'
 ```
 
-For Mt Sync, use an OAuth-configured remote and choose a root inside one document library rather than the virtual root.
+## Usage
+
+`rclone-pkudisk` uses the normal rclone command-line interface.
+
+List files:
+
+```bash
+rclone-pkudisk lsf 'pku:<document-library>/'
+```
+
+Copy a directory to PKU Disk:
+
+```bash
+rclone-pkudisk copy ~/Documents \
+  'pku:<document-library>/Documents' \
+  --progress
+```
+
+Download files:
+
+```bash
+rclone-pkudisk copy \
+  'pku:<document-library>/Documents' \
+  ~/Documents-from-PKU \
+  --progress
+```
+
+Move or rename a file:
+
+```bash
+rclone-pkudisk moveto \
+  'pku:<document-library>/old-name.txt' \
+  'pku:<document-library>/new-name.txt'
+```
+
+Use `--dry-run` before an unfamiliar or potentially destructive operation:
+
+```bash
+rclone-pkudisk copy ~/Documents \
+  'pku:<document-library>/Documents' \
+  --dry-run -v
+```
+
+## Using PKU Disk as a backup target
+
+For a one-way backup where the local filesystem is authoritative, prefer `copy`:
+
+```bash
+rclone-pkudisk copy ~/important-data \
+  'pku:<document-library>/backup/important-data'
+```
+
+Repeated `copy` runs upload new or changed files but do **not** remove an existing remote file merely because it was deleted locally. This is generally the safer behavior for a backup target.
+
+By contrast, `sync` makes the destination match the source and can delete destination files that no longer exist locally:
+
+```bash
+# Mirror semantics: destination-only files may be deleted.
+rclone-pkudisk sync ~/mirror-me \
+  'pku:<document-library>/mirror-me'
+```
+
+Use `sync` only when mirror semantics are actually intended.
+
+### Symlinks
+
+rclone skips symbolic links by default. To back up the contents pointed to by symlinks, use `-L` / `--copy-links`:
+
+```bash
+rclone-pkudisk copy -L ~/important-data \
+  'pku:<document-library>/backup/important-data'
+```
+
+`--copy-links` follows both file and directory symlinks. Be careful with directory symlink cycles: rclone itself does not maintain a general visited-directory set, so callers that follow arbitrary directory symlinks should ensure the source tree does not contain recursive directory links or filter those links explicitly.
 
 ## Modification times
 
-AnyShare exposes two different timestamps for files:
+AnyShare exposes both a server-side update timestamp (`modified`) and a client-provided timestamp (`client_mtime`). `rclone-pkudisk` exposes `client_mtime` as rclone `ModTime`, falling back to `modified` when it is absent, and uploads the source modification time as `client_mtime`.
 
-- `modified`: the server-side commit/update time
-- `client_mtime`: the original client-provided file modification time
-
-`rclone-pkudisk` uses `client_mtime` for rclone `ModTime`, falling back to `modified` only when `client_mtime` is absent. Uploads send the source modification time as `client_mtime`.
-
-PKU Disk preserves this value at microsecond precision, including across server-side moves. This is important because PKU Disk does not expose a content hash through the APIs currently used by this backend; ordinary rclone comparison therefore relies on size plus modification time.
+This matters because the APIs currently used by the backend do not expose a content hash. Ordinary rclone comparison therefore relies mainly on size plus modification time.
 
 Changing the modification time of an already-uploaded object without uploading new content is not supported, so `SetModTime` returns rclone's `ErrorCantSetModTime`.
 
 ## Filename compatibility
 
-AnyShare rejects or normalizes some names that are valid on Linux, including Windows-style reserved characters and leading/trailing whitespace.
+AnyShare rejects or normalizes some names that are valid on Linux. The backend uses rclone's standard reversible `encoder.MultiEncoder` rather than a custom escaping scheme.
 
-The backend uses rclone's standard reversible `encoder.MultiEncoder` rather than a custom escaping scheme. The default encoding covers, among other cases:
-
-- `\\ / : * ? " < > |`
-- control characters and DEL
-- `.` and `..`
-- leading and trailing spaces
-- trailing periods
-- invalid UTF-8
-
-Names are encoded only at the AnyShare boundary and decoded when listed, so rclone and sync frontends continue to see the original names.
-
-The encoding can be overridden with the normal `encoding` advanced backend option.
+The default encoding covers Windows-style reserved characters, control characters, `.` and `..`, leading/trailing spaces, trailing periods, invalid UTF-8, and related edge cases. Names are decoded again when listed, so rclone callers continue to see their original names.
 
 ## Upload and download behavior
 
-Uploads require a known object size. This matches normal local-file synchronization and Mt Sync usage.
+Uploads require a known object size. Small files use AnyShare's signed single-upload flow; larger files use its multipart flow while streaming the source rather than buffering the whole object in memory.
 
-Small files use AnyShare's signed single-upload flow. Larger files use the multipart flow (`osinitmultiupload`, signed part uploads, completion, and `osendupload`) while streaming data rather than buffering the entire object in memory.
-
-Downloads use signed AnyShare object-storage URLs and support rclone range requests. The bundled TrustAsia intermediate certificate compensates for the PKU object-storage endpoint omitting that intermediate from its served certificate chain on affected systems.
-
-Object transfers do not have a backend-specific whole-transfer wall-clock timeout; cancellation and higher-level timeouts are left to rclone/context handling.
-
-## Move semantics
-
-AnyShare GNS document IDs can change when an entry changes parent. The backend therefore re-resolves the entry after a parent move before issuing any following operation.
-
-When a move also renames an entry, the backend selects the safe server-side operation order based on intermediate-name conflicts:
-
-- move then rename when the source name is free in the destination
-- rename then move when moving first would collide
-- return rclone's `ErrorCantMove` / `ErrorCantDirMove` when both possible intermediate names collide, allowing higher-level fallback instead of risking a partially mutated object
-
-Directory moves use rclone's `dircache.DirMove` preparation logic, including rooted-Fs moves where `srcRemote` or `dstRemote` is empty.
+Downloads use signed AnyShare object-storage URLs and support rclone range requests. The backend also bundles the TrustAsia intermediate certificate needed on systems where the PKU object-storage endpoint does not serve that intermediate in its certificate chain.
 
 ## Current limitations
 
-The backend intentionally does not yet implement several optional rclone capabilities:
+Several optional rclone capabilities are not implemented yet:
 
 - `ListR`
 - server-side `Copy`
 - content hashes
 - quota / `About`
 - change notifications
-- changing mtime without a content upload
+- changing mtime without uploading content
 - uploads whose size is unknown in advance
 
-These are not required for ordinary local-to-PKU synchronization. `ListR` is the most obvious future performance improvement for trees with many directories; server-side `Copy` would avoid download/re-upload for PKU-to-PKU copies.
+The most visible performance limitation is the lack of `ListR`: scans of trees containing many directories require more API requests than a backend with recursive listing support.
 
-## Authentication note for long-running sync
+Server-side `Move` is implemented. PKU-to-PKU copies fall back to the normal rclone download/upload path because server-side `Copy` is not implemented.
 
-For a desktop synchronization setup, the recommended stack is:
+## Development
 
-```text
-Mt Sync
-   ↓
-rclone-pkudisk
-   ↓  OAuth
-PKU Disk / AnyShare
+Run the test suite and static checks with:
+
+```bash
+go test ./...
+go vet ./...
+go build -o bin/rclone-pkudisk .
 ```
 
-Use `auth = oauth` for this path. Treat `auth = pkudist` as a convenience mode for reusing a currently healthy official-client session, not as the durable credential source for an unattended synchronizer.
+The project intentionally embeds the backend into a small rclone executable rather than patching an installed rclone tree. The backend implementation lives under `backend/pkudisk`.
 
 ## License
 
-MIT. See [COPYING](COPYING).
+MIT. See [LICENSE](LICENSE).
