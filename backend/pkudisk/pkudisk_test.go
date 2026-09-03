@@ -83,3 +83,56 @@ func TestListVirtualRootAndDirectory(t *testing.T) {
 		t.Fatalf("modtime = %s, want client_mtime %s", file.ModTime(context.Background()), want)
 	}
 }
+
+func TestNewFsRecoversWhenRootLookupTemporarilyFailsForDirectory(t *testing.T) {
+	var personalListCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/efast/v1/entry-doc-lib":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{
+				"id": "gns://personal", "name": "Personal", "type": "user_doc_lib",
+			}})
+		case "/api/efast/v1/dir/list":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			switch body["docid"] {
+			case "gns://personal":
+				personalListCalls++
+				if personalListCalls == 1 {
+					http.Error(w, `{"message":"temporary failure"}`, http.StatusInternalServerError)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"dirs":  []map[string]any{{"docid": "gns://personal/docs", "name": "docs", "size": -1}},
+					"files": []map[string]any{},
+				})
+			case "gns://personal/docs":
+				_ = json.NewEncoder(w).Encode(map[string]any{"dirs": []map[string]any{}, "files": []map[string]any{}})
+			default:
+				http.Error(w, "bad docid", http.StatusBadRequest)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	m := configmap.Simple{
+		"auth":         "token",
+		"access_token": "test-token",
+		"base_url":     server.URL,
+		"encoding":     defaultEncoding.String(),
+	}
+	backend, err := NewFs(context.Background(), "pku", "Personal/docs", m)
+	if err != nil {
+		t.Fatalf("NewFs returned an error for an existing directory after a transient root lookup failure: %v", err)
+	}
+	entries, err := backend.List(context.Background(), "")
+	if err != nil {
+		t.Fatalf("List after root lookup recovery: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("root entries = %#v, want empty directory", entries)
+	}
+}

@@ -177,7 +177,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			return f, nil
 		}
 		if _, objectErr := tempF.NewObject(ctx, remote); objectErr != nil {
-			if errors.Is(objectErr, fs.ErrorObjectNotFound) {
+			if errors.Is(objectErr, fs.ErrorObjectNotFound) || errors.Is(objectErr, fs.ErrorIsDir) {
 				return f, nil
 			}
 			return nil, objectErr
