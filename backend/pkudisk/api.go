@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -14,6 +15,15 @@ import (
 )
 
 const defaultBaseURL = "https://disk.pku.edu.cn"
+
+const (
+	defaultAPITimeout        = 60 * time.Second
+	recursiveDeleteTimeout   = 5 * time.Minute
+	transientReadAttempts    = 3
+	transientReadFastTimeout = 20 * time.Second
+	transientReadSlowTimeout = 60 * time.Second
+	transientRetryDelay      = 250 * time.Millisecond
+)
 
 var reauthenticationCodes = map[int64]struct{}{
 	// These codes have been observed in the PKU AnyShare client / bridge as
@@ -35,9 +45,10 @@ var reauthenticationCodes = map[int64]struct{}{
 }
 
 type apiClient struct {
-	baseURL string
-	http    *http.Client
-	tokens  tokenProvider
+	baseURL             string
+	http                *http.Client
+	recursiveDeleteHTTP *http.Client
+	tokens              tokenProvider
 }
 
 type library struct {
@@ -122,7 +133,10 @@ func newAPIClient(baseURL string, tokens tokenProvider) *apiClient {
 	return &apiClient{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		http: &http.Client{
-			Timeout: 60 * time.Second,
+			Timeout: defaultAPITimeout,
+		},
+		recursiveDeleteHTTP: &http.Client{
+			Timeout: recursiveDeleteTimeout,
 		},
 		tokens: tokens,
 	}
@@ -133,6 +147,10 @@ func (c *apiClient) endpoint(path string) string {
 }
 
 func (c *apiClient) do(ctx context.Context, method, endpoint string, body any) ([]byte, error) {
+	return c.doWithClient(ctx, c.http, method, endpoint, body)
+}
+
+func (c *apiClient) doWithClient(ctx context.Context, client *http.Client, method, endpoint string, body any) ([]byte, error) {
 	var encoded []byte
 	var err error
 	if body != nil {
@@ -160,7 +178,7 @@ func (c *apiClient) do(ctx context.Context, method, endpoint string, body any) (
 		if body != nil {
 			req.Header.Set("Content-Type", "application/json")
 		}
-		resp, err := c.http.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("PKU Disk request failed: %w", err)
 		}
@@ -196,6 +214,49 @@ func (c *apiClient) doJSON(ctx context.Context, method, endpoint string, body, o
 		return fmt.Errorf("decode PKU Disk response from %s: %w", endpoint, err)
 	}
 	return nil
+}
+
+func transientReadTimeout(attempt int) time.Duration {
+	if attempt == 0 {
+		return transientReadFastTimeout
+	}
+	return transientReadSlowTimeout
+}
+
+func (c *apiClient) doJSONWithTransientRetry(ctx context.Context, method, endpoint string, body, out any) error {
+	return retryTransient(ctx, transientReadAttempts, func(attempt int) error {
+		attemptCtx, cancel := context.WithTimeout(ctx, transientReadTimeout(attempt))
+		defer cancel()
+		return c.doJSON(attemptCtx, method, endpoint, body, out)
+	})
+}
+
+func retryTransient(ctx context.Context, attempts int, fn func(attempt int) error) error {
+	var err error
+	for attempt := 0; attempt < attempts; attempt++ {
+		err = fn(attempt)
+		if err == nil || !isTransientError(err) || attempt+1 == attempts {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(transientRetryDelay << attempt):
+		}
+	}
+	return err
+}
+
+func isTransientError(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var apiErr *apiError
+	if errors.As(err, &apiErr) {
+		return apiErr.Status == http.StatusTooManyRequests || apiErr.Status >= http.StatusInternalServerError
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func parseAPIError(status int, data []byte) error {
@@ -253,13 +314,13 @@ func firstNonEmpty(values ...string) string {
 
 func (c *apiClient) libraries(ctx context.Context) ([]library, error) {
 	var result []library
-	err := c.doJSON(ctx, http.MethodGet, "efast/v1/entry-doc-lib", nil, &result)
+	err := c.doJSONWithTransientRetry(ctx, http.MethodGet, "efast/v1/entry-doc-lib", nil, &result)
 	return result, err
 }
 
 func (c *apiClient) listDir(ctx context.Context, docID string) (directoryListing, error) {
 	var result directoryListing
-	err := c.doJSON(ctx, http.MethodPost, "efast/v1/dir/list", map[string]any{
+	err := c.doJSONWithTransientRetry(ctx, http.MethodPost, "efast/v1/dir/list", map[string]any{
 		"docid": docID,
 		"by":    "name",
 		"sort":  "asc",
@@ -269,7 +330,7 @@ func (c *apiClient) listDir(ctx context.Context, docID string) (directoryListing
 
 func (c *apiClient) metadata(ctx context.Context, docID string) (fileMetadata, error) {
 	var result fileMetadata
-	err := c.doJSON(ctx, http.MethodPost, "efast/v1/file/metadata", map[string]any{"docid": docID}, &result)
+	err := c.doJSONWithTransientRetry(ctx, http.MethodPost, "efast/v1/file/metadata", map[string]any{"docid": docID}, &result)
 	if result.DocID == "" {
 		result.DocID = docID
 	}
@@ -303,11 +364,13 @@ func (c *apiClient) createDir(ctx context.Context, parentID, name string) (strin
 func (c *apiClient) deleteEntry(ctx context.Context, docID string, isDir bool) error {
 	kind := "file"
 	body := map[string]any{"docid": docID}
+	client := c.http
 	if isDir {
 		kind = "dir"
 		body["check_upload_process"] = true
+		client = c.recursiveDeleteHTTP
 	}
-	_, err := c.do(ctx, http.MethodPost, "efast/v1/"+kind+"/delete", body)
+	_, err := c.doWithClient(ctx, client, http.MethodPost, "efast/v1/"+kind+"/delete", body)
 	return err
 }
 

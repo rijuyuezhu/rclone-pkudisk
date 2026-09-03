@@ -357,6 +357,38 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	return nil
 }
 
+// Purge removes dir and all of its contents using AnyShare's native
+// recursive directory delete operation. The virtual root and document
+// libraries are deliberately protected.
+func (f *Fs) Purge(ctx context.Context, dir string) error {
+	if dir == "" && f.root == "" {
+		return errors.New("cannot purge PKU Disk virtual root")
+	}
+	id, err := f.dirCache.FindDir(ctx, dir, false)
+	if err != nil || id == virtualRootID {
+		return fs.ErrorDirNotFound
+	}
+
+	var parentID string
+	if dir == "" {
+		parentID, err = f.dirCache.RootParentID(ctx, false)
+	} else {
+		parent, _ := dircache.SplitPath(dir)
+		parentID, err = f.dirCache.FindDir(ctx, parent, false)
+	}
+	if err != nil {
+		return err
+	}
+	if parentID == virtualRootID {
+		return errors.New("PKU Disk document libraries cannot be removed through the file API")
+	}
+	if err := f.api.deleteEntry(ctx, id, true); err != nil {
+		return err
+	}
+	f.dirCache.FlushDir(dir)
+	return nil
+}
+
 func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
 	source, ok := src.(*Object)
 	if !ok || source.fs.name != f.name {
@@ -602,5 +634,6 @@ var (
 	_ fs.Fs       = (*Fs)(nil)
 	_ fs.Mover    = (*Fs)(nil)
 	_ fs.DirMover = (*Fs)(nil)
+	_ fs.Purger   = (*Fs)(nil)
 	_ fs.Object   = (*Object)(nil)
 )

@@ -12,12 +12,13 @@ It builds a standalone rclone executable with the `pkudisk` backend included. A 
 The backend currently supports the operations needed for ordinary file transfer and local-to-PKU backup workflows:
 
 - list document libraries, directories, and files
-- create and remove directories
+- create and remove directories, including native recursive purge of non-empty directory trees
 - upload new files and update existing files as AnyShare revisions
 - signed single uploads and multipart uploads
 - downloads and ranged reads
 - remove files
 - server-side file and directory moves
+- bounded retry of transient timeout, HTTP 429, and HTTP 5xx failures on read-only metadata/listing requests
 - reversible filename encoding for names AnyShare rejects or normalizes
 - source modification times through AnyShare `client_mtime`
 - OAuth login and refresh independent of the official desktop client
@@ -175,7 +176,11 @@ rclone-pkudisk sync ~/mirror-me \
   'pku:<document-library>/mirror-me'
 ```
 
-Use `sync` only when mirror semantics are actually intended.
+Use `sync` only when mirror semantics are actually intended. rclone's generic sync engine removes destination-only files individually before removing empty directories. If an entire remote subtree is known to be obsolete, `purge` is much more efficient because this backend maps it to AnyShare's native recursive directory deletion:
+
+```bash
+rclone-pkudisk purge 'pku:<document-library>/obsolete-tree'
+```
 
 ### Symlinks
 

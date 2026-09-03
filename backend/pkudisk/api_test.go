@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 type rotatingTokenProvider struct {
@@ -56,6 +58,77 @@ func TestAPIClientRetriesObservedAuthSessionCodes(t *testing.T) {
 	}
 	if len(provider.refreshCalls) != 2 || provider.refreshCalls[0] || !provider.refreshCalls[1] {
 		t.Fatalf("refresh calls = %#v, want [false true]", provider.refreshCalls)
+	}
+}
+
+func TestListDirRetriesTransientServerError(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if requests == 1 {
+			http.Error(w, `{"message":"temporary"}`, http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"dirs": []any{}, "files": []any{}})
+	}))
+	defer server.Close()
+
+	client := newAPIClient(server.URL, &staticTokenProvider{token: "test-token"})
+	if _, err := client.listDir(context.Background(), "gns://dir"); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 2 {
+		t.Fatalf("requests = %d, want 2", requests)
+	}
+}
+
+func TestListDirRetriesRequestTimeout(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) == 1 {
+			time.Sleep(30 * time.Millisecond)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"dirs": []any{}, "files": []any{}})
+	}))
+	defer server.Close()
+
+	client := newAPIClient(server.URL, &staticTokenProvider{token: "test-token"})
+	client.http.Timeout = 10 * time.Millisecond
+	if _, err := client.listDir(context.Background(), "gns://dir"); err != nil {
+		t.Fatal(err)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("requests = %d, want 2", got)
+	}
+}
+
+func TestTransientReadTimeoutBacksOffToSlowAttempt(t *testing.T) {
+	if got := transientReadTimeout(0); got != transientReadFastTimeout {
+		t.Fatalf("first read timeout = %s, want %s", got, transientReadFastTimeout)
+	}
+	for _, attempt := range []int{1, 2} {
+		if got := transientReadTimeout(attempt); got != transientReadSlowTimeout {
+			t.Fatalf("read timeout for attempt %d = %s, want %s", attempt, got, transientReadSlowTimeout)
+		}
+	}
+}
+
+func TestDirectoryDeleteUsesLongerHTTPTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(30 * time.Millisecond)
+		_ = json.NewEncoder(w).Encode(map[string]any{})
+	}))
+	defer server.Close()
+
+	client := newAPIClient(server.URL, &staticTokenProvider{token: "test-token"})
+	client.http.Timeout = 5 * time.Millisecond
+	client.recursiveDeleteHTTP.Timeout = 100 * time.Millisecond
+
+	if err := client.deleteEntry(context.Background(), "gns://dir", true); err != nil {
+		t.Fatalf("directory delete unexpectedly used the short API timeout: %v", err)
+	}
+	if err := client.deleteEntry(context.Background(), "gns://file", false); err == nil {
+		t.Fatal("file delete unexpectedly ignored the short API timeout")
 	}
 }
 
