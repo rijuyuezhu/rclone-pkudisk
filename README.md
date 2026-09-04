@@ -27,17 +27,21 @@ The backend has been exercised against a live PKU Disk account with large direct
 
 ## Installation
 
+### Prebuilt binaries
+
+Prebuilt archives are published on the [GitHub Releases](https://github.com/rijuyuezhu/rclone-pkudisk/releases) page together with `SHA256SUMS`.
+
+Release versions include the embedded rclone version. For example, `v1.74.4-pkudisk.1` means rclone v1.74.4 with PKU Disk downstream revision 1. Archive names follow rclone's OS/architecture naming and cover the same release targets except AIX, which is not supported by the LevelDB dependency used for optional `pkudist` authentication. The archives are portable CGO-free cross-builds; the matrix follows rclone's platform coverage, but macOS packages do not include rclone's optional macFUSE/`cmount` build profile.
+
 ### Install with Go
 
-Go 1.25 or newer is required.
-
-Once the repository is published, install the latest version with:
+Go 1.25 or newer is required:
 
 ```bash
 go install github.com/rijuyuezhu/rclone-pkudisk@latest
 ```
 
-The binary is installed as `rclone-pkudisk` under `GOBIN`, or under `$(go env GOPATH)/bin` when `GOBIN` is unset.
+The binary is installed as `rclone-pkudisk` under `GOBIN`, or under `$(go env GOPATH)/bin` when `GOBIN` is unset. The upstream rclone `selfupdate` command is disabled in `rclone-pkudisk` so it cannot accidentally replace this binary with an official rclone build that lacks the `pkudisk` backend.
 
 ### Build from source
 
@@ -240,6 +244,8 @@ go build -o bin/rclone-pkudisk .
 ```
 
 The project intentionally embeds the backend into a small rclone executable rather than patching an installed rclone tree. The backend implementation lives under `backend/pkudisk`.
+
+Release tags are derived from the pinned rclone version plus `REVISION`; `./scripts/version.sh release` prints the exact tag to create. Pushing that tag runs the release workflow, which tests the tree, builds the 28 targets listed in `scripts/release-targets.txt`, and publishes the archives with `SHA256SUMS`. A single archive can be built locally with `./scripts/build-release.sh linux/amd64`.
 
 ## License
 

@@ -4,6 +4,7 @@ _junk/
 /rclone
 /rclone.exe
 /build/
+/dist/
 *.test
 *.out
 *.orig

@@ -1,0 +1,158 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*-pkudisk.*"
+
+permissions:
+  contents: read
+
+jobs:
+  metadata:
+    name: Validate release metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      targets: ${{ steps.release.outputs.targets }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Validate tag and build matrix
+        id: release
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          expected_tag=$(./scripts/version.sh tag)
+          if [[ "$RELEASE_TAG" != "$expected_tag" ]]; then
+            echo "release tag must match source version: expected $expected_tag, got $RELEASE_TAG" >&2
+            exit 1
+          fi
+          targets=$(jq -R -s -c 'split("\n") | map(select(length > 0))' scripts/release-targets.txt)
+          target_count=$(jq 'length' <<<"$targets")
+          unique_target_count=$(jq 'unique | length' <<<"$targets")
+          if [[ $target_count -eq 0 || $target_count -ne $unique_target_count ]]; then
+            echo "release target matrix must be non-empty and contain no duplicates" >&2
+            exit 1
+          fi
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+
+  quality:
+    name: Quality gate
+    needs: metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.metadata.outputs.tag }}
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '~1.26.5'
+          cache: true
+      - run: go test ./...
+      - run: go vet ./...
+      - name: Verify release version and disabled self-update
+        run: |
+          suffix=$(./scripts/version.sh suffix)
+          expected=$(./scripts/version.sh release)
+          go build \
+            -buildvcs=false \
+            -trimpath \
+            -tags noselfupdate \
+            -ldflags "-s -w -X github.com/rclone/rclone/fs.VersionSuffix=$suffix" \
+            -o /tmp/rclone-pkudisk \
+            .
+          actual=$(/tmp/rclone-pkudisk version | sed -n '1s/^rclone //p')
+          if [[ "$actual" != "$expected" ]]; then
+            echo "release binary version mismatch: expected $expected, got $actual" >&2
+            exit 1
+          fi
+          if /tmp/rclone-pkudisk selfupdate --help >/tmp/selfupdate.out 2>&1; then
+            echo "selfupdate unexpectedly succeeded" >&2
+            exit 1
+          fi
+          grep -q 'unknown command "selfupdate"' /tmp/selfupdate.out
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs:
+      - metadata
+      - quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.metadata.outputs.targets) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.metadata.outputs.tag }}
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '~1.26.5'
+          cache: true
+      - name: Ensure zip is available
+        run: |
+          if ! command -v zip >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --yes zip
+          fi
+      - name: Build release archive
+        env:
+          TARGET: ${{ matrix.target }}
+        run: ./scripts/build-release.sh "$TARGET" dist
+      - name: Name artifact
+        id: artifact
+        env:
+          TARGET: ${{ matrix.target }}
+        run: echo "name=release-${TARGET//\//-}" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - metadata
+      - build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.metadata.outputs.tag }}
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Verify artifacts and create checksums
+        run: |
+          expected=$(wc -l < scripts/release-targets.txt)
+          actual=$(find dist -maxdepth 1 -type f -name '*.zip' | wc -l)
+          if [[ "$actual" -ne "$expected" ]]; then
+            echo "expected $expected release archives, found $actual" >&2
+            exit 1
+          fi
+          (cd dist && sha256sum ./*.zip | sort -k2 > SHA256SUMS)
+          (cd dist && sha256sum -c SHA256SUMS)
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            dist/* \
+            --verify-tag \
+            --title "rclone-pkudisk $RELEASE_TAG" \
+            --generate-notes

@@ -3,7 +3,7 @@ module github.com/rijuyuezhu/rclone-pkudisk
 go 1.25.0
 
 require (
-	github.com/rclone/rclone v1.74.1
+	github.com/rclone/rclone v1.74.4
 	github.com/syndtr/goleveldb v1.0.0
 	golang.org/x/oauth2 v0.36.0
 )
@@ -34,13 +34,14 @@ require (
 	github.com/cpuguy83/go-md2man/v2 v2.0.7 // indirect
 	github.com/dsnet/compress v0.0.2-0.20230904184137-39efe44ab707 // indirect
 	github.com/ebitengine/purego v0.10.1 // indirect
+	github.com/fsnotify/fsnotify v1.7.0 // indirect
 	github.com/gdamore/encoding v1.0.1 // indirect
 	github.com/gdamore/tcell/v2 v2.13.8 // indirect
 	github.com/go-chi/chi/v5 v5.3.1 // indirect
 	github.com/go-darwin/apfs v0.0.0-20211011131704-f84b94dbf348 // indirect
 	github.com/go-git/go-billy/v5 v5.9.0 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
-	github.com/golang/snappy v0.0.0-20180518054509-2e65f85255db // indirect
+	github.com/golang/snappy v0.0.4 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gopherjs/gopherjs v1.21.0 // indirect
 	github.com/hanwen/go-fuse/v2 v2.10.1 // indirect
@@ -68,6 +69,8 @@ require (
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/ncw/swift/v2 v2.0.5 // indirect
 	github.com/nwaples/rardecode/v2 v2.2.5 // indirect
+	github.com/onsi/ginkgo v1.16.5 // indirect
+	github.com/onsi/gomega v1.37.0 // indirect
 	github.com/patrickmn/go-cache v2.1.0+incompatible // indirect
 	github.com/peterh/liner v1.2.2 // indirect
 	github.com/pierrec/lz4/v4 v4.1.27 // indirect
@@ -102,6 +105,7 @@ require (
 	github.com/winfsp/cgofuse v1.6.1-0.20260126094232-f2c4fccdb286 // indirect
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
+	github.com/zeebo/assert v1.3.1 // indirect
 	github.com/zeebo/blake3 v0.2.4 // indirect
 	github.com/zeebo/xxh3 v1.1.0 // indirect
 	go.etcd.io/bbolt v1.5.0 // indirect
