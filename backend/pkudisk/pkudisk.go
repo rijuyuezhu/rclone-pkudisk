@@ -398,6 +398,62 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 	return nil
 }
 
+func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	source, ok := src.(*Object)
+	if !ok || source.fs.name != f.name {
+		return nil, fs.ErrorCantCopy
+	}
+
+	dstDir, dstLeaf := dircache.SplitPath(remote)
+	dstParentID, err := f.dirCache.FindDir(ctx, dstDir, true)
+	if err != nil {
+		return nil, err
+	}
+	if dstParentID == virtualRootID {
+		return nil, fs.ErrorCantCopy
+	}
+
+	_, srcLeaf := dircache.SplitPath(source.remote)
+	existing, existingErr := f.NewObject(ctx, remote)
+	switch {
+	case existingErr == nil:
+		if existing.(*Object).id == source.id {
+			return existing, nil
+		}
+		// AnyShare's copy overwrite mode has no destination revision guard.
+		// Preserve the backend's existing optimistic-concurrency semantics by
+		// letting rclone use the normal Update path for replacements.
+		return nil, fs.ErrorCantCopy
+	case errors.Is(existingErr, fs.ErrorObjectNotFound):
+		// New destination.
+	case errors.Is(existingErr, fs.ErrorIsDir):
+		return nil, fs.ErrorCantCopy
+	default:
+		return nil, existingErr
+	}
+
+	needsRename := srcLeaf != dstLeaf
+	ondup := 1 // fail rather than overwrite an unexpected concurrent entry
+	if needsRename {
+		ondup = 2 // auto-name the temporary copy; rename it by returned docid
+	}
+	copiedID, err := f.api.copyFile(ctx, source.id, dstParentID, ondup)
+	if err != nil {
+		return nil, err
+	}
+
+	if needsRename {
+		if err := f.api.renameEntry(ctx, copiedID, f.encodeName(dstLeaf), false); err != nil {
+			cleanupErr := f.api.deleteEntry(ctx, copiedID, false)
+			if cleanupErr != nil {
+				return nil, fmt.Errorf("rename server-side copy: %w (cleanup failed: %v)", err, cleanupErr)
+			}
+			return nil, fmt.Errorf("rename server-side copy: %w", err)
+		}
+	}
+	return f.NewObject(ctx, remote)
+}
+
 func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
 	source, ok := src.(*Object)
 	if !ok || source.fs.name != f.name {

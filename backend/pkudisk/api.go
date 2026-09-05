@@ -410,6 +410,21 @@ func (c *apiClient) moveEntry(ctx context.Context, docID, parentID string, isDir
 	return err
 }
 
+func (c *apiClient) copyFile(ctx context.Context, docID, parentID string, ondup int) (string, error) {
+	var result mutationResult
+	if err := c.doJSON(ctx, http.MethodPost, "efast/v1/file/copy", map[string]any{
+		"docid":      docID,
+		"destparent": parentID,
+		"ondup":      ondup,
+	}, &result); err != nil {
+		return "", err
+	}
+	if result.docID() == "" {
+		return "", errors.New("PKU Disk copy response is missing docid")
+	}
+	return result.docID(), nil
+}
+
 func (c *apiClient) downloadURL(ctx context.Context, meta fileMetadata) (string, error) {
 	var result struct {
 		AuthRequest []any `json:"authrequest"`
