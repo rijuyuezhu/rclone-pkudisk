@@ -337,6 +337,14 @@ func (c *apiClient) metadata(ctx context.Context, docID string) (fileMetadata, e
 	return result, err
 }
 
+func (c *apiClient) getInfoByPath(ctx context.Context, namePath string) (entry, error) {
+	var result entry
+	err := c.doJSONWithTransientRetry(ctx, http.MethodPost, "efast/v1/file/getinfobypath", map[string]any{
+		"namepath": namePath,
+	}, &result)
+	return result, err
+}
+
 func (c *apiClient) createDir(ctx context.Context, parentID, name string) (string, error) {
 	var result mutationResult
 	if err := c.doJSON(ctx, http.MethodPost, "efast/v1/dir/create", map[string]any{
