@@ -71,6 +71,15 @@ func init() {
 				Advanced: true,
 			},
 			{
+				Name: "upload_concurrency",
+				Help: `Concurrency for multipart uploads.
+
+This is the number of chunks of the same file that rclone uploads concurrently.
+Lower this when the network or server benefits from fewer parallel requests; increase it only when testing shows additional streams improve throughput.`,
+				Default:  defaultUploadConcurrency,
+				Advanced: true,
+			},
+			{
 				Name:      "oauth_client_id",
 				Help:      "Dynamically registered AnyShare OAuth client ID.",
 				Hide:      fs.OptionHideBoth,
@@ -105,6 +114,7 @@ type Options struct {
 	OAuthClientID     string               `config:"oauth_client_id"`
 	OAuthClientSecret string               `config:"oauth_client_secret"`
 	OAuthUDID         string               `config:"oauth_udid"`
+	UploadConcurrency int                  `config:"upload_concurrency"`
 	Enc               encoder.MultiEncoder `config:"encoding"`
 }
 
@@ -131,6 +141,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	opt := new(Options)
 	if err := configstruct.Set(m, opt); err != nil {
 		return nil, err
+	}
+	if opt.UploadConcurrency == 0 {
+		opt.UploadConcurrency = defaultUploadConcurrency
+	} else if opt.UploadConcurrency < 0 {
+		return nil, errors.New("pkudisk upload_concurrency must be positive")
 	}
 	var tokens tokenProvider
 	switch strings.ToLower(strings.TrimSpace(opt.Auth)) {

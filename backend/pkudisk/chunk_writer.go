@@ -12,7 +12,7 @@ import (
 	"github.com/rclone/rclone/fs"
 )
 
-const defaultChunkWriterConcurrency = 4
+const defaultUploadConcurrency = 4
 
 // pkudiskChunkWriter maps rclone's native multi-thread upload interface onto
 // AnyShare's multipart object-storage protocol. rclone owns the scheduling and
@@ -200,9 +200,13 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		resumeState: state,
 	}
 	handedOffStore = true
+	concurrency := f.opt.UploadConcurrency
+	if concurrency < 1 {
+		concurrency = defaultUploadConcurrency
+	}
 	return fs.ChunkWriterInfo{
 		ChunkSize:   partSize,
-		Concurrency: defaultChunkWriterConcurrency,
+		Concurrency: concurrency,
 		// Ask rclone to call Abort on transfer failure so the cross-process
 		// state lock is released. Abort intentionally preserves completed parts
 		// and resume state because AnyShare has no observed safe abort endpoint.

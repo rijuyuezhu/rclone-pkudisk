@@ -142,12 +142,17 @@ func TestOpenChunkWriterResumesCompletedPartWithoutReadingSource(t *testing.T) {
 	}
 	store.release()
 
+	f.opt.UploadConcurrency = 1
+
 	info, writer, err := f.OpenChunkWriter(ctx, remote, src)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if info.LeavePartsOnError {
 		t.Fatal("LeavePartsOnError must be false so rclone calls Abort to release the state lock")
+	}
+	if info.Concurrency != 1 {
+		t.Fatalf("chunk writer concurrency = %d, want configured value 1", info.Concurrency)
 	}
 	if requestedParts != "2" {
 		t.Fatalf("OpenChunkWriter requested %q, want only missing part 2", requestedParts)
