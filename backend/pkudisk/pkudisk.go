@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"path"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/hash"
+	rclonelog "github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/oauthutil"
@@ -38,7 +40,7 @@ const (
 )
 
 func init() {
-	fs.Register(&fs.RegInfo{
+	registerBackend(&fs.RegInfo{
 		Name:        "pkudisk",
 		Description: "Peking University PKU Disk (AnyShare)",
 		NewFs:       NewFs,
@@ -104,6 +106,42 @@ Lower this when the network or server benefits from fewer parallel requests; inc
 			},
 		},
 	})
+}
+
+// registrationLogFilter is a compatibility shim for rclone >= v1.75.0.
+// fs.Register now expects every backend to have overview YAML embedded in the
+// rclone module. Out-of-tree backends cannot add files to that embedded FS, so
+// registration otherwise emits a misleading "internal error" even though the
+// backend was registered successfully. Forward every other registration log.
+type registrationLogFilter struct {
+	slog.Handler
+	message string
+}
+
+func (h registrationLogFilter) Handle(ctx context.Context, record slog.Record) error {
+	if record.Level == slog.LevelError && record.Message == h.message {
+		return nil
+	}
+	return h.Handler.Handle(ctx, record)
+}
+
+func registerBackend(info *fs.RegInfo) {
+	handler := rclonelog.Handler
+	fs.SetLogger(registrationLogFilter{
+		Handler: handler,
+		message: fmt.Sprintf("internal error: no overview data found for %q", info.Name),
+	})
+	fs.Register(info)
+	fs.SetLogger(handler)
+
+	// rclone's fallback overview is intentionally empty. Mark this as an
+	// external backend instead of pretending it has one of rclone's upstream
+	// support tiers. fs.Register always installs the fallback before returning.
+	info.Overview.Backend = info.Name
+	info.Overview.Name = info.Description
+	info.Overview.Tier = "External"
+	info.Overview.Maintainers = "External"
+	info.Overview.Remote = info.Name + ":"
 }
 
 type Options struct {

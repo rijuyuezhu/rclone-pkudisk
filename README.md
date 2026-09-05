@@ -31,11 +31,11 @@ The backend has been exercised against a live PKU Disk account with large direct
 
 Prebuilt archives are published on the [GitHub Releases](https://github.com/rijuyuezhu/rclone-pkudisk/releases) page together with `SHA256SUMS`.
 
-Release versions include the embedded rclone version. For example, `v1.74.4-pkudisk.1` means rclone v1.74.4 with PKU Disk downstream revision 1. Archive names follow rclone's OS/architecture naming and cover the same release targets except AIX, which is not supported by the LevelDB dependency used for optional `pkudist` authentication. The archives are portable CGO-free cross-builds; the matrix follows rclone's platform coverage, but macOS packages do not include rclone's optional macFUSE/`cmount` build profile.
+Release versions include the embedded rclone version. For example, `v1.75.1-pkudisk.1` means rclone v1.75.1 with PKU Disk downstream revision 1. Archive names follow rclone's OS/architecture naming and cover the same release targets except AIX, which is not supported by the LevelDB dependency used for optional `pkudist` authentication. The archives are portable CGO-free cross-builds; the matrix follows rclone's platform coverage, but macOS packages do not include rclone's optional macFUSE/`cmount` build profile.
 
 ### Install with Go
 
-Go 1.25 or newer is required:
+Go 1.26 or newer is required:
 
 ```bash
 go install github.com/rijuyuezhu/rclone-pkudisk@latest
