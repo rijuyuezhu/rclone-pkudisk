@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"path"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -108,12 +109,13 @@ type Options struct {
 }
 
 type Fs struct {
-	name     string
-	root     string
-	opt      Options
-	api      *apiClient
-	dirCache *dircache.DirCache
-	features *fs.Features
+	name      string
+	root      string
+	opt       Options
+	api       *apiClient
+	dirCache  *dircache.DirCache
+	features  *fs.Features
+	resumeDir string
 }
 
 type Object struct {
@@ -158,10 +160,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	root = strings.Trim(root, "/")
 	f := &Fs{
-		name: name,
-		root: root,
-		opt:  *opt,
-		api:  newAPIClient(opt.BaseURL, tokens),
+		name:      name,
+		root:      root,
+		opt:       *opt,
+		api:       newAPIClient(opt.BaseURL, tokens),
+		resumeDir: filepath.Join(config.GetCacheDir(), "pkudisk", "multipart"),
 	}
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: true,
