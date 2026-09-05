@@ -493,10 +493,18 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	if err != nil {
 		return nil, err
 	}
-	if _, err := f.relocateEntry(ctx, source.id, srcParentID, dstParentID, srcLeaf, dstLeaf, false, fs.ErrorCantMove); err != nil {
+	newID, err := f.relocateEntry(ctx, source.id, srcParentID, dstParentID, srcLeaf, dstLeaf, false)
+	if err != nil {
 		return nil, err
 	}
-	return f.NewObject(ctx, remote)
+	return &Object{
+		fs:      f,
+		remote:  remote,
+		id:      newID,
+		size:    source.size,
+		modTime: source.modTime,
+		rev:     source.rev,
+	}, nil
 }
 
 func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
@@ -517,7 +525,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	if srcParentID == virtualRootID || dstParentID == virtualRootID {
 		return fs.ErrorCantDirMove
 	}
-	if _, err := f.relocateEntry(ctx, srcID, srcParentID, dstParentID, srcLeaf, dstLeaf, true, fs.ErrorCantDirMove); err != nil {
+	if _, err := f.relocateEntry(ctx, srcID, srcParentID, dstParentID, srcLeaf, dstLeaf, true); err != nil {
 		return err
 	}
 	source.dirCache.FlushDir(srcRemote)
@@ -525,7 +533,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	return nil
 }
 
-func (f *Fs) relocateEntry(ctx context.Context, id, srcParentID, dstParentID, srcLeaf, dstLeaf string, isDir bool, cantMove error) (string, error) {
+func (f *Fs) relocateEntry(ctx context.Context, id, srcParentID, dstParentID, srcLeaf, dstLeaf string, isDir bool) (string, error) {
 	if srcParentID == dstParentID {
 		if srcLeaf == dstLeaf {
 			return id, nil
@@ -533,97 +541,19 @@ func (f *Fs) relocateEntry(ctx context.Context, id, srcParentID, dstParentID, sr
 		if err := f.api.renameEntry(ctx, id, f.encodeName(dstLeaf), isDir); err != nil {
 			return "", err
 		}
-		return f.resolveChildID(ctx, srcParentID, dstLeaf, isDir)
+		// Rename keeps the object in the same parent and preserves its docid.
+		return id, nil
 	}
 
-	if srcLeaf == dstLeaf {
-		if err := f.api.moveEntry(ctx, id, dstParentID, isDir); err != nil {
-			return "", err
-		}
-		return f.resolveChildID(ctx, dstParentID, dstLeaf, isDir)
+	newName := ""
+	if srcLeaf != dstLeaf {
+		newName = f.encodeName(dstLeaf)
 	}
-
-	dstHasSourceName, err := f.childExists(ctx, dstParentID, srcLeaf, isDir)
+	newID, err := f.api.moveEntry(ctx, id, dstParentID, newName, isDir)
 	if err != nil {
 		return "", err
 	}
-	if !dstHasSourceName {
-		if err := f.api.moveEntry(ctx, id, dstParentID, isDir); err != nil {
-			return "", err
-		}
-		movedID, err := f.resolveChildID(ctx, dstParentID, srcLeaf, isDir)
-		if err != nil {
-			return "", err
-		}
-		if err := f.api.renameEntry(ctx, movedID, f.encodeName(dstLeaf), isDir); err != nil {
-			return "", err
-		}
-		return f.resolveChildID(ctx, dstParentID, dstLeaf, isDir)
-	}
-
-	// Moving first would collide with an existing destination entry that has
-	// the source name. Rename first if that intermediate name is free in the
-	// source directory. If both intermediate names collide, let rclone fall
-	// back instead of leaving a partially renamed server-side object.
-	srcHasDestinationName, err := f.childExists(ctx, srcParentID, dstLeaf, isDir)
-	if err != nil {
-		return "", err
-	}
-	if srcHasDestinationName {
-		return "", cantMove
-	}
-	if err := f.api.renameEntry(ctx, id, f.encodeName(dstLeaf), isDir); err != nil {
-		return "", err
-	}
-	renamedID, err := f.resolveChildID(ctx, srcParentID, dstLeaf, isDir)
-	if err != nil {
-		return "", err
-	}
-	if err := f.api.moveEntry(ctx, renamedID, dstParentID, isDir); err != nil {
-		// Best-effort rollback: keep the source path stable when the second
-		// server-side operation fails.
-		_ = f.api.renameEntry(ctx, renamedID, f.encodeName(srcLeaf), isDir)
-		return "", err
-	}
-	return f.resolveChildID(ctx, dstParentID, dstLeaf, isDir)
-}
-
-func (f *Fs) childExists(ctx context.Context, parentID, leaf string, isDir bool) (bool, error) {
-	listing, err := f.api.listDir(ctx, parentID)
-	if err != nil {
-		return false, err
-	}
-	entries := listing.Files
-	if isDir {
-		entries = listing.Dirs
-	}
-	for _, item := range entries {
-		if f.decodeName(item.Name) == leaf {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-func (f *Fs) resolveChildID(ctx context.Context, parentID, leaf string, isDir bool) (string, error) {
-	listing, err := f.api.listDir(ctx, parentID)
-	if err != nil {
-		return "", err
-	}
-	entries := listing.Files
-	if isDir {
-		entries = listing.Dirs
-	}
-	for _, item := range entries {
-		if f.decodeName(item.Name) == leaf {
-			return item.DocID, nil
-		}
-	}
-	kind := "file"
-	if isDir {
-		kind = "directory"
-	}
-	return "", fmt.Errorf("moved PKU Disk %s %q could not be resolved in destination", kind, leaf)
+	return newID, nil
 }
 
 func (o *Object) Fs() fs.Info { return o.fs }

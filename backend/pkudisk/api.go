@@ -395,19 +395,28 @@ func (c *apiClient) renameEntry(ctx context.Context, docID, name string, isDir b
 	return err
 }
 
-func (c *apiClient) moveEntry(ctx context.Context, docID, parentID string, isDir bool) error {
+func (c *apiClient) moveEntry(ctx context.Context, docID, parentID, newName string, isDir bool) (string, error) {
 	kind := "file"
 	body := map[string]any{
 		"docid":      docID,
 		"destparent": parentID,
 		"ondup":      1,
 	}
+	if newName != "" {
+		body["new_name"] = newName
+	}
 	if isDir {
 		kind = "dir"
 		body["check_upload_process"] = true
 	}
-	_, err := c.do(ctx, http.MethodPost, "efast/v1/"+kind+"/move", body)
-	return err
+	var result mutationResult
+	if err := c.doJSON(ctx, http.MethodPost, "efast/v1/"+kind+"/move", body, &result); err != nil {
+		return "", err
+	}
+	if result.docID() == "" {
+		return "", errors.New("PKU Disk move response is missing docid; remote state may have changed")
+	}
+	return result.docID(), nil
 }
 
 func (c *apiClient) copyFile(ctx context.Context, docID, parentID string, ondup int) (string, error) {
