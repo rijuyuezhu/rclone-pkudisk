@@ -167,6 +167,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		CanHaveEmptyDirectories: true,
 	}).Fill(ctx, f)
 	f.dirCache = dircache.New(root, virtualRootID, f)
+	if handled, isFile := f.tryResolveRootByPath(ctx); handled {
+		if isFile {
+			return f, fs.ErrorIsFile
+		}
+		return f, nil
+	}
 
 	if err := f.dirCache.FindRoot(ctx, false); err != nil {
 		newRoot, remote := dircache.SplitPath(root)
@@ -278,6 +284,9 @@ func (f *Fs) objectFromEntry(remote string, item entry) *Object {
 }
 
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+	if object, handled, err := f.newObjectByPath(ctx, remote); handled {
+		return object, err
+	}
 	dir, leaf := dircache.SplitPath(remote)
 	parentID, err := f.dirCache.FindDir(ctx, dir, false)
 	if err != nil || parentID == virtualRootID {
