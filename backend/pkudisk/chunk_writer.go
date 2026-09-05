@@ -32,6 +32,9 @@ type pkudiskChunkWriter struct {
 	partInfo map[string][]any
 	closed   bool
 	aborted  bool
+
+	resumeStore *multipartResumeStore
+	resumeState *multipartResumeState
 }
 
 // OpenChunkWriter starts an AnyShare multipart upload suitable for rclone's
@@ -41,6 +44,14 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 	if size <= 0 {
 		return info, nil, &fs.FileTooSmallError{MinSize: 1}
 	}
+	modTime := src.ModTime(ctx)
+	resumeStore := f.openMultipartResumeStore(ctx, remote)
+	handedOffStore := false
+	defer func() {
+		if !handedOffStore {
+			resumeStore.release()
+		}
+	}()
 
 	leaf, parentID, err := f.dirCache.FindPath(ctx, remote, true)
 	if err != nil {
@@ -67,33 +78,104 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		return info, nil, err
 	}
 	partCount := (size + partSize - 1) / partSize
+	startFresh := func() (multipartInit, error) {
+		var fresh multipartInit
+		if err := f.api.doJSON(ctx, http.MethodPost, "efast/v1/file/osinitmultiupload", uploadStartBody(
+			parentID,
+			f.encodeName(leaf),
+			existingID,
+			existingRev,
+			size,
+			modTime,
+		), &fresh); err != nil {
+			return multipartInit{}, err
+		}
+		if fresh.DocID == "" || fresh.Rev == "" || fresh.UploadID == "" {
+			return multipartInit{}, errors.New("PKU Disk multipart init response is incomplete")
+		}
+		return fresh, nil
+	}
+
+	var state *multipartResumeState
+	state, stateErr := resumeStore.load()
+	if stateErr != nil {
+		fs.Debugf(f, "discarding unreadable multipart resume state for %q: %v", remote, stateErr)
+		_ = resumeStore.remove()
+		state = nil
+	}
+	resumed := state != nil && state.validFor(size, modTime, existingID, existingRev, partSize, partCount)
+	if state != nil && !resumed {
+		fs.Debugf(f, "discarding stale multipart resume state for %q", remote)
+		_ = resumeStore.remove()
+		state = nil
+	}
 
 	var init multipartInit
-	if err := f.api.doJSON(ctx, http.MethodPost, "efast/v1/file/osinitmultiupload", uploadStartBody(
-		parentID,
-		f.encodeName(leaf),
-		existingID,
-		existingRev,
-		size,
-		src.ModTime(ctx),
-	), &init); err != nil {
-		return info, nil, err
-	}
-	if init.DocID == "" || init.Rev == "" || init.UploadID == "" {
-		return info, nil, errors.New("PKU Disk multipart init response is incomplete")
+	partInfo := make(map[string][]any, partCount)
+	if resumed {
+		init = state.Init
+		if state.Completed == nil {
+			state.Completed = make(map[string]multipartResumePart)
+		}
+		partInfo = state.partInfo()
+		fs.Debugf(f, "resuming multipart upload %q with %d/%d completed parts", remote, len(partInfo), partCount)
+	} else {
+		init, err = startFresh()
+		if err != nil {
+			return info, nil, err
+		}
+		state = newMultipartResumeState(size, modTime, existingID, existingRev, partSize, partCount, init)
+		if err := resumeStore.save(state); err != nil {
+			fs.Debugf(f, "persist initial multipart resume state for %q: %v", remote, err)
+		}
 	}
 
-	var signedParts multipartSignedParts
-	if err := f.api.doJSON(ctx, http.MethodPost, "efast/v1/file/osuploadpart", map[string]any{
-		"docid":    init.DocID,
-		"rev":      init.Rev,
-		"uploadid": init.UploadID,
-		"parts":    fmt.Sprintf("1-%d", partCount),
-	}, &signedParts); err != nil {
-		return info, nil, err
+	ranges := missingMultipartRanges(partCount, partInfo)
+	signedParts, signErr := f.api.signMultipartParts(ctx, init, ranges)
+	if signErr != nil && resumed {
+		// A multipart upload ID can expire. AnyShare's osuploadrefresh creates
+		// a replacement ID but does not carry completed object-store parts into
+		// the new session, so refresh is a safe restart, not a partial resume.
+		refreshed, refreshErr := f.api.refreshMultipartUpload(ctx, init, size)
+		if refreshErr != nil {
+			fs.Debugf(f, "multipart resume for %q could not be refreshed (%v); starting a fresh session", remote, refreshErr)
+			_ = resumeStore.remove()
+			init, err = startFresh()
+			if err != nil {
+				return info, nil, fmt.Errorf("resume multipart upload %q: sign remaining parts: %w; refresh failed: %v; fresh init failed: %w", remote, signErr, refreshErr, err)
+			}
+			partInfo = make(map[string][]any, partCount)
+			state = newMultipartResumeState(size, modTime, existingID, existingRev, partSize, partCount, init)
+			if err := resumeStore.save(state); err != nil {
+				fs.Debugf(f, "persist replacement multipart resume state for %q: %v", remote, err)
+			}
+			ranges = missingMultipartRanges(partCount, partInfo)
+			signedParts, signErr = f.api.signMultipartParts(ctx, init, ranges)
+			if signErr != nil {
+				return info, nil, signErr
+			}
+		} else {
+			fs.Debugf(f, "multipart upload ID for %q expired; restarting incomplete upload", remote)
+			init = refreshed
+			partInfo = make(map[string][]any, partCount)
+			state.Init = refreshed
+			state.Completed = make(map[string]multipartResumePart)
+			if err := resumeStore.save(state); err != nil {
+				fs.Debugf(f, "persist refreshed multipart resume state for %q: %v", remote, err)
+			}
+			ranges = missingMultipartRanges(partCount, partInfo)
+			signedParts, signErr = f.api.signMultipartParts(ctx, init, ranges)
+		}
+	}
+	if signErr != nil {
+		return info, nil, signErr
 	}
 	for part := int64(1); part <= partCount; part++ {
-		if len(signedParts.AuthRequests[strconv.FormatInt(part, 10)]) < 2 {
+		key := strconv.FormatInt(part, 10)
+		if _, done := partInfo[key]; done {
+			continue
+		}
+		if len(signedParts.AuthRequests[key]) < 2 {
 			return info, nil, fmt.Errorf("PKU Disk multipart response is missing signed request for part %d", part)
 		}
 	}
@@ -112,16 +194,18 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		partSize:    partSize,
 		partCount:   partCount,
 		signedParts: signedParts,
-		partInfo:    make(map[string][]any, partCount),
+		partInfo:    partInfo,
+		resumeStore: resumeStore,
+		resumeState: state,
 	}
+	handedOffStore = true
 	return fs.ChunkWriterInfo{
 		ChunkSize:   partSize,
 		Concurrency: defaultChunkWriterConcurrency,
-		// No abort endpoint has been observed in the AnyShare desktop client or
-		// public EFAST upload protocol. Be explicit that completed parts may be
-		// left server-side when a transfer is interrupted; resumable state is a
-		// separate concern and must not be faked by deleting the destination.
-		LeavePartsOnError: true,
+		// Ask rclone to call Abort on transfer failure so the cross-process
+		// state lock is released. Abort intentionally preserves completed parts
+		// and resume state because AnyShare has no observed safe abort endpoint.
+		LeavePartsOnError: false,
 	}, cw, nil
 }
 
@@ -129,6 +213,9 @@ func (w *pkudiskChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, re
 	if chunkNumber < 0 || int64(chunkNumber) >= w.partCount {
 		return 0, fmt.Errorf("invalid PKU Disk multipart chunk %d", chunkNumber)
 	}
+	part := int64(chunkNumber) + 1
+	partKey := strconv.FormatInt(part, 10)
+	expected := min(w.partSize, w.size-int64(chunkNumber)*w.partSize)
 
 	w.mu.Lock()
 	if w.closed {
@@ -139,10 +226,13 @@ func (w *pkudiskChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, re
 		w.mu.Unlock()
 		return 0, errors.New("PKU Disk multipart writer is aborted")
 	}
+	if _, done := w.partInfo[partKey]; done {
+		w.mu.Unlock()
+		fs.Debugf(nil, "PKU Disk multipart resume: skipping completed part %d/%d", part, w.partCount)
+		return expected, nil
+	}
 	w.mu.Unlock()
 
-	part := int64(chunkNumber) + 1
-	partKey := strconv.FormatInt(part, 10)
 	signed, err := parseHeaderSignedRequest(w.signedParts.AuthRequests[partKey])
 	if err != nil {
 		return 0, fmt.Errorf("multipart part %d: %w", part, err)
@@ -151,7 +241,6 @@ func (w *pkudiskChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, re
 	if _, err := reader.Seek(0, io.SeekStart); err != nil {
 		return 0, fmt.Errorf("seek multipart part %d: %w", part, err)
 	}
-	expected := min(w.partSize, w.size-int64(chunkNumber)*w.partSize)
 	req, err := http.NewRequestWithContext(ctx, signed.method, signed.url, io.LimitReader(reader, expected))
 	if err != nil {
 		return 0, err
@@ -178,6 +267,12 @@ func (w *pkudiskChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, re
 		return 0, errors.New("PKU Disk multipart writer changed state while uploading a part")
 	}
 	w.partInfo[partKey] = []any{etag, expected}
+	if w.resumeState != nil {
+		w.resumeState.Completed[partKey] = multipartResumePart{ETag: etag, Size: expected}
+		if err := w.resumeStore.save(w.resumeState); err != nil {
+			fs.Debugf(nil, "persist PKU Disk multipart resume state after part %d: %v", part, err)
+		}
+	}
 	return expected, nil
 }
 
@@ -204,18 +299,34 @@ func (w *pkudiskChunkWriter) Close(ctx context.Context) error {
 	w.mu.Unlock()
 
 	_, err := w.api.finishMultipartUpload(ctx, w.init, w.existingRev, partInfo, w.objectHTTP)
-	return err
+	if err != nil {
+		// Once finalization starts, a failure can be ambiguous: the object
+		// store may already have consumed the multipart upload ID while the
+		// AnyShare osendupload step did not finish. Do not carry that state into
+		// another process and risk a permanently unrecoverable completion loop.
+		if removeErr := w.resumeStore.remove(); removeErr != nil {
+			fs.Debugf(nil, "discard ambiguous PKU Disk multipart finalization state: %v", removeErr)
+		}
+		w.resumeStore.release()
+		return err
+	}
+	if err := w.resumeStore.remove(); err != nil {
+		fs.Debugf(nil, "remove completed PKU Disk multipart resume state: %v", err)
+	}
+	w.resumeStore.release()
+	return nil
 }
 
 func (w *pkudiskChunkWriter) Abort(context.Context) error {
 	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.closed {
-		return nil
+	if !w.closed {
+		w.aborted = true
 	}
-	w.aborted = true
+	w.mu.Unlock()
 	// AnyShare does not expose an observed safe multipart-abort operation.
 	// In particular, deleting init.DocID would be unsafe for an interrupted
 	// update because it may be the ID of the pre-existing destination object.
+	// Persisted completed-part state is deliberately retained for the next run.
+	w.resumeStore.release()
 	return nil
 }

@@ -14,10 +14,10 @@ The backend currently supports the operations needed for ordinary file transfer 
 - list document libraries, directories, and files
 - create and remove directories, including native recursive purge of non-empty directory trees
 - upload new files and update existing files as AnyShare revisions
-- signed single uploads and multipart uploads, with rclone-native concurrent chunk uploads for large files
+- signed single uploads and multipart uploads, with rclone-native concurrent and cross-process resumable chunk uploads for large files
 - downloads and ranged reads
 - remove files
-- server-side file and directory moves
+- server-side file copies plus file and directory moves
 - bounded retry of transient timeout, HTTP 429, and HTTP 5xx failures on read-only metadata/listing requests
 - reversible filename encoding for names AnyShare rejects or normalizes
 - source modification times through AnyShare `client_mtime`
@@ -215,6 +215,8 @@ The default encoding covers Windows-style reserved characters, control character
 
 Uploads require a known object size. Small files use AnyShare's signed single-upload flow; larger files use its multipart flow while streaming the source rather than buffering the whole object in memory. When rclone selects its multi-thread copy path (256 MiB and above by default), the backend exposes AnyShare multipart parts through `OpenChunkWriter`, so rclone can upload independent parts concurrently. The usual rclone `--multi-thread-cutoff` and `--multi-thread-streams` controls determine when the multi-thread path is considered; the backend currently advertises four-way multipart concurrency.
 
+Interrupted `OpenChunkWriter` uploads are resumable across rclone process restarts. Minimal state is kept under rclone's cache directory in `pkudisk/multipart`: the AnyShare upload ID, completed part ETags/sizes, source size+mtime, and the pre-existing destination ID/revision for updates. Signed object-storage URLs and authorization headers are never persisted. A changed source or destination revision invalidates the state; an expired upload ID is refreshed and restarted safely from part 1. Successful completion removes the JSON state. Platforms without advisory file locking keep the ordinary multipart behavior but disable cross-process resume.
+
 Downloads use signed AnyShare object-storage URLs and support rclone range requests. The backend also bundles the TrustAsia intermediate certificate needed on systems where the PKU object-storage endpoint does not serve that intermediate in its certificate chain.
 
 ## Current limitations
@@ -222,7 +224,6 @@ Downloads use signed AnyShare object-storage URLs and support rclone range reque
 Several optional rclone capabilities are not implemented yet:
 
 - `ListR`
-- server-side `Copy`
 - content hashes
 - quota / `About`
 - change notifications
@@ -231,7 +232,7 @@ Several optional rclone capabilities are not implemented yet:
 
 The most visible performance limitation is the lack of `ListR`: scans of trees containing many directories require more API requests than a backend with recursive listing support.
 
-Server-side `Move` is implemented. PKU-to-PKU copies fall back to the normal rclone download/upload path because server-side `Copy` is not implemented.
+Server-side file `Copy` is implemented for new destinations. If the destination already exists, the backend deliberately falls back to rclone's normal update path because AnyShare's copy-overwrite mode has no destination revision guard; this preserves the optimistic-concurrency protection used by ordinary updates.
 
 ## Development
 

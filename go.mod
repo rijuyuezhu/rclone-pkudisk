@@ -3,6 +3,7 @@ module github.com/rijuyuezhu/rclone-pkudisk
 go 1.25.0
 
 require (
+	github.com/gofrs/flock v0.13.0
 	github.com/rclone/rclone v1.74.4
 	github.com/syndtr/goleveldb v1.0.0
 	golang.org/x/oauth2 v0.36.0

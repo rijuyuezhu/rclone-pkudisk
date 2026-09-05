@@ -39,6 +39,44 @@ type multipartSignedParts struct {
 	AuthRequests map[string][]string `json:"authrequests"`
 }
 
+func (c *apiClient) signMultipartParts(ctx context.Context, init multipartInit, ranges []string) (multipartSignedParts, error) {
+	result := multipartSignedParts{AuthRequests: make(map[string][]string)}
+	for _, parts := range ranges {
+		var batch multipartSignedParts
+		if err := c.doJSON(ctx, http.MethodPost, "efast/v1/file/osuploadpart", map[string]any{
+			"docid":    init.DocID,
+			"rev":      init.Rev,
+			"uploadid": init.UploadID,
+			"parts":    parts,
+		}, &batch); err != nil {
+			return multipartSignedParts{}, err
+		}
+		for part, request := range batch.AuthRequests {
+			result.AuthRequests[part] = request
+		}
+	}
+	return result, nil
+}
+
+func (c *apiClient) refreshMultipartUpload(ctx context.Context, init multipartInit, size int64) (multipartInit, error) {
+	var refreshed struct {
+		UploadID string `json:"uploadid"`
+	}
+	if err := c.doJSON(ctx, http.MethodPost, "efast/v1/file/osuploadrefresh", map[string]any{
+		"docid":       init.DocID,
+		"rev":         init.Rev,
+		"length":      size,
+		"multiupload": true,
+	}, &refreshed); err != nil {
+		return multipartInit{}, err
+	}
+	if refreshed.UploadID == "" {
+		return multipartInit{}, errors.New("PKU Disk multipart refresh response is missing uploadid")
+	}
+	init.UploadID = refreshed.UploadID
+	return init, nil
+}
+
 type signedRequest struct {
 	method  string
 	url     string
