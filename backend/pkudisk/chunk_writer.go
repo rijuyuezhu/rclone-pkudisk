@@ -181,14 +181,9 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		}
 	}
 
-	objectHTTP, err := newObjectHTTPClient()
-	if err != nil {
-		return info, nil, err
-	}
-
 	cw := &pkudiskChunkWriter{
 		api:         f.api,
-		objectHTTP:  objectHTTP,
+		objectHTTP:  f.api.objectHTTP,
 		init:        init,
 		existingRev: existingRev,
 		size:        size,

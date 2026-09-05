@@ -55,7 +55,7 @@ func TestPutUpdatesExistingObject(t *testing.T) {
 	f := &Fs{
 		name: "pku",
 		opt:  Options{Enc: defaultEncoding},
-		api:  newAPIClient(server.URL, &staticTokenProvider{token: "test-token"}),
+		api:  mustNewAPIClient(t, context.Background(), server.URL, &staticTokenProvider{token: "test-token"}),
 	}
 	f.dirCache = dircache.New("", virtualRootID, f)
 	if err := f.dirCache.FindRoot(ctx, false); err != nil {

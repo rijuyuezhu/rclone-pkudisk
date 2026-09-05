@@ -174,11 +174,15 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	root = strings.Trim(root, "/")
+	api, err := newAPIClient(ctx, opt.BaseURL, tokens)
+	if err != nil {
+		return nil, err
+	}
 	f := &Fs{
 		name:      name,
 		root:      root,
 		opt:       *opt,
-		api:       newAPIClient(opt.BaseURL, tokens),
+		api:       api,
 		resumeDir: filepath.Join(config.GetCacheDir(), "pkudisk", "multipart"),
 	}
 	f.features = (&fs.Features{
@@ -620,11 +624,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 			req.Header.Set(key, value)
 		}
 	}
-	client, err := newObjectHTTPClient()
-	if err != nil {
-		return nil, err
-	}
-	resp, err := client.Do(req)
+	resp, err := o.fs.api.objectHTTP.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("download from PKU object storage: %w", err)
 	}

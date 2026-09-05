@@ -15,7 +15,7 @@ func newCachedTestFs(t *testing.T, ctx context.Context, serverURL string) *Fs {
 	t.Helper()
 	f := &Fs{
 		name: "pku",
-		api:  newAPIClient(serverURL, &staticTokenProvider{token: "test-token"}),
+		api:  mustNewAPIClient(t, context.Background(), serverURL, &staticTokenProvider{token: "test-token"}),
 	}
 	f.dirCache = dircache.New("", virtualRootID, f)
 	if err := f.dirCache.FindRoot(ctx, false); err != nil {
@@ -122,7 +122,7 @@ func TestRelocateEntrySameParentRenamePreservesDocID(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := &Fs{opt: Options{Enc: defaultEncoding}, api: newAPIClient(server.URL, &staticTokenProvider{token: "test-token"})}
+	f := &Fs{opt: Options{Enc: defaultEncoding}, api: mustNewAPIClient(t, context.Background(), server.URL, &staticTokenProvider{token: "test-token"})}
 	gotID, err := f.relocateEntry(ctx, id, "gns://personal/src", "gns://personal/src", "old.txt", "new.txt", false)
 	if err != nil {
 		t.Fatal(err)
@@ -149,7 +149,7 @@ func TestRelocateEntrySameNameMoveOmitsNewName(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := &Fs{opt: Options{Enc: defaultEncoding}, api: newAPIClient(server.URL, &staticTokenProvider{token: "test-token"})}
+	f := &Fs{opt: Options{Enc: defaultEncoding}, api: mustNewAPIClient(t, context.Background(), server.URL, &staticTokenProvider{token: "test-token"})}
 	gotID, err := f.relocateEntry(ctx, "old-id", "gns://personal/src", "gns://personal/dst", "same.txt", "same.txt", false)
 	if err != nil {
 		t.Fatal(err)
@@ -167,7 +167,7 @@ func TestRelocateEntryMissingMoveDocIDReportsAmbiguousState(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := &Fs{opt: Options{Enc: defaultEncoding}, api: newAPIClient(server.URL, &staticTokenProvider{token: "test-token"})}
+	f := &Fs{opt: Options{Enc: defaultEncoding}, api: mustNewAPIClient(t, context.Background(), server.URL, &staticTokenProvider{token: "test-token"})}
 	_, err := f.relocateEntry(ctx, "old-id", "gns://personal/src", "gns://personal/dst", "old.txt", "new.txt", false)
 	if err == nil || !strings.Contains(err.Error(), "missing docid") || !strings.Contains(err.Error(), "remote state may have changed") {
 		t.Fatalf("error = %v, want explicit ambiguous-state error", err)

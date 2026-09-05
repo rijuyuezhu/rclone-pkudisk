@@ -14,6 +14,7 @@ import (
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
+	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/lib/oauthutil"
 	"golang.org/x/oauth2"
 )
@@ -128,7 +129,8 @@ func registerOAuthClient(ctx context.Context, baseURL string) (clientID, clientS
 		return "", "", "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := fshttp.NewClient(ctx)
+	client.Timeout = 30 * time.Second
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", "", "", fmt.Errorf("register PKU Disk OAuth client: %w", err)
