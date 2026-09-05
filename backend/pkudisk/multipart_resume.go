@@ -19,7 +19,7 @@ import (
 	"github.com/rclone/rclone/fs"
 )
 
-const multipartResumeVersion = 1
+const multipartResumeVersion = 2
 
 type multipartResumePart struct {
 	ETag string `json:"etag"`
@@ -27,15 +27,36 @@ type multipartResumePart struct {
 }
 
 type multipartResumeState struct {
-	Version     int                            `json:"version"`
-	Size        int64                          `json:"size"`
-	ModTimeNsec int64                          `json:"mod_time_nsec"`
-	ExistingID  string                         `json:"existing_id,omitempty"`
-	ExistingRev string                         `json:"existing_rev,omitempty"`
-	PartSize    int64                          `json:"part_size"`
-	PartCount   int64                          `json:"part_count"`
-	Init        multipartInit                  `json:"init"`
-	Completed   map[string]multipartResumePart `json:"completed,omitempty"`
+	Version        int                            `json:"version"`
+	SourceIdentity string                         `json:"source_identity"`
+	Size           int64                          `json:"size"`
+	ModTimeNsec    int64                          `json:"mod_time_nsec"`
+	ExistingID     string                         `json:"existing_id,omitempty"`
+	ExistingRev    string                         `json:"existing_rev,omitempty"`
+	PartSize       int64                          `json:"part_size"`
+	PartCount      int64                          `json:"part_count"`
+	Init           multipartInit                  `json:"init"`
+	Completed      map[string]multipartResumePart `json:"completed,omitempty"`
+}
+
+// multipartResumeSourceIdentity identifies the source object without storing
+// its path or config string in the resume cache. The fast fingerprint follows
+// rclone's own change-detection semantics: it includes size/modtime and uses a
+// source hash only when the source backend can provide one cheaply. An object
+// ID, when available, further distinguishes replacement objects at one path.
+func multipartResumeSourceIdentity(ctx context.Context, src fs.ObjectInfo) string {
+	h := sha256.New()
+	write := func(value string) {
+		_, _ = h.Write([]byte(value))
+		_, _ = h.Write([]byte{0})
+	}
+	write(fs.ConfigString(src.Fs()))
+	write(src.Remote())
+	write(fs.Fingerprint(ctx, src, true))
+	if ider, ok := src.(fs.IDer); ok {
+		write(ider.ID())
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 type multipartResumeStore struct {
@@ -169,22 +190,24 @@ func (s *multipartResumeStore) remove() error {
 	return err
 }
 
-func newMultipartResumeState(size int64, modTime time.Time, existingID, existingRev string, partSize, partCount int64, init multipartInit) *multipartResumeState {
+func newMultipartResumeState(sourceIdentity string, size int64, modTime time.Time, existingID, existingRev string, partSize, partCount int64, init multipartInit) *multipartResumeState {
 	return &multipartResumeState{
-		Version:     multipartResumeVersion,
-		Size:        size,
-		ModTimeNsec: modTime.UnixNano(),
-		ExistingID:  existingID,
-		ExistingRev: existingRev,
-		PartSize:    partSize,
-		PartCount:   partCount,
-		Init:        init,
-		Completed:   make(map[string]multipartResumePart),
+		Version:        multipartResumeVersion,
+		SourceIdentity: sourceIdentity,
+		Size:           size,
+		ModTimeNsec:    modTime.UnixNano(),
+		ExistingID:     existingID,
+		ExistingRev:    existingRev,
+		PartSize:       partSize,
+		PartCount:      partCount,
+		Init:           init,
+		Completed:      make(map[string]multipartResumePart),
 	}
 }
 
-func (s *multipartResumeState) validFor(size int64, modTime time.Time, existingID, existingRev string, partSize, partCount int64) bool {
+func (s *multipartResumeState) validFor(sourceIdentity string, size int64, modTime time.Time, existingID, existingRev string, partSize, partCount int64) bool {
 	if s == nil || s.Version != multipartResumeVersion ||
+		s.SourceIdentity == "" || s.SourceIdentity != sourceIdentity ||
 		s.Size != size || s.ModTimeNsec != modTime.UnixNano() ||
 		s.ExistingID != existingID || s.ExistingRev != existingRev ||
 		s.PartSize != partSize || s.PartCount != partCount ||
