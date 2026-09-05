@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"unicode/utf16"
 
 	"github.com/syndtr/goleveldb/leveldb"
@@ -44,6 +45,7 @@ func (p *staticTokenProvider) Token(context.Context, bool) (string, error) {
 
 type pkudistTokenProvider struct {
 	levelDBPath string
+	mu          sync.RWMutex
 	token       string
 }
 
@@ -71,6 +73,17 @@ func newPkudistTokenProvider(configured string) (*pkudistTokenProvider, error) {
 }
 
 func (p *pkudistTokenProvider) Token(_ context.Context, refresh bool) (string, error) {
+	if !refresh {
+		p.mu.RLock()
+		token := p.token
+		p.mu.RUnlock()
+		if token != "" {
+			return token, nil
+		}
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.token != "" && !refresh {
 		return p.token, nil
 	}

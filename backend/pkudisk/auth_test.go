@@ -1,10 +1,13 @@
 package pkudisk
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"unicode/utf16"
 )
@@ -77,5 +80,47 @@ func TestDecodeLocalStorageString(t *testing.T) {
 	got, err = decodeLocalStorageString(raw)
 	if err != nil || got != "北大" {
 		t.Fatalf("UTF-16 decode = %q, %v", got, err)
+	}
+}
+
+func TestPkudistTokenProviderConcurrentRefreshAndRead(t *testing.T) {
+	dir := t.TempDir()
+	tokenJSON, err := json.Marshal(map[string]string{"access_token": "concurrent-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := make([]byte, 12)
+	binary.LittleEndian.PutUint64(record[:8], 42)
+	binary.LittleEndian.PutUint32(record[8:12], 1)
+	record = appendWriteBatchValue(record, tokenKey, append([]byte{1}, tokenJSON...))
+	physical := make([]byte, 7)
+	binary.LittleEndian.PutUint16(physical[4:6], uint16(len(record)))
+	physical[6] = 1 // FULL
+	physical = append(physical, record...)
+	if err := os.WriteFile(filepath.Join(dir, "000001.log"), physical, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	provider := &pkudistTokenProvider{levelDBPath: dir}
+	const goroutines = 64
+	errs := make(chan error, goroutines)
+	var wg sync.WaitGroup
+	for i := range goroutines {
+		wg.Add(1)
+		go func(refresh bool) {
+			defer wg.Done()
+			token, err := provider.Token(context.Background(), refresh)
+			if err == nil && token != "concurrent-token" {
+				err = fmt.Errorf("unexpected token %q", token)
+			}
+			errs <- err
+		}(i%2 == 0)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 }
