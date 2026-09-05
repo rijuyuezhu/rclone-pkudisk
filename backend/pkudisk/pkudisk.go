@@ -243,7 +243,10 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (string, error)
 func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 	id, err := f.dirCache.FindDir(ctx, dir, false)
 	if err != nil {
-		return nil, fs.ErrorDirNotFound
+		if errors.Is(err, fs.ErrorDirNotFound) {
+			return nil, fs.ErrorDirNotFound
+		}
+		return nil, err
 	}
 	entries := fs.DirEntries{}
 	if id == virtualRootID {
@@ -292,7 +295,13 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	}
 	dir, leaf := dircache.SplitPath(remote)
 	parentID, err := f.dirCache.FindDir(ctx, dir, false)
-	if err != nil || parentID == virtualRootID {
+	if err != nil {
+		if errors.Is(err, fs.ErrorDirNotFound) {
+			return nil, fs.ErrorObjectNotFound
+		}
+		return nil, err
+	}
+	if parentID == virtualRootID {
 		return nil, fs.ErrorObjectNotFound
 	}
 	listing, err := f.api.listDir(ctx, parentID)
@@ -340,7 +349,13 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 		return errors.New("cannot remove PKU Disk virtual root")
 	}
 	id, err := f.dirCache.FindDir(ctx, dir, false)
-	if err != nil || id == virtualRootID {
+	if err != nil {
+		if errors.Is(err, fs.ErrorDirNotFound) {
+			return fs.ErrorDirNotFound
+		}
+		return err
+	}
+	if id == virtualRootID {
 		return fs.ErrorDirNotFound
 	}
 	// rclone constructs an Fs rooted at the target for `rmdir remote:path`
@@ -377,7 +392,13 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 		return errors.New("cannot purge PKU Disk virtual root")
 	}
 	id, err := f.dirCache.FindDir(ctx, dir, false)
-	if err != nil || id == virtualRootID {
+	if err != nil {
+		if errors.Is(err, fs.ErrorDirNotFound) {
+			return fs.ErrorDirNotFound
+		}
+		return err
+	}
+	if id == virtualRootID {
 		return fs.ErrorDirNotFound
 	}
 
