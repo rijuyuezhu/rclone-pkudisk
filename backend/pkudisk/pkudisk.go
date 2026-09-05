@@ -631,9 +631,10 @@ func (o *Object) Remove(ctx context.Context) error {
 }
 
 var (
-	_ fs.Fs       = (*Fs)(nil)
-	_ fs.Mover    = (*Fs)(nil)
-	_ fs.DirMover = (*Fs)(nil)
-	_ fs.Purger   = (*Fs)(nil)
-	_ fs.Object   = (*Object)(nil)
+	_ fs.Fs              = (*Fs)(nil)
+	_ fs.Mover           = (*Fs)(nil)
+	_ fs.DirMover        = (*Fs)(nil)
+	_ fs.Purger          = (*Fs)(nil)
+	_ fs.OpenChunkWriter = (*Fs)(nil)
+	_ fs.Object          = (*Object)(nil)
 )

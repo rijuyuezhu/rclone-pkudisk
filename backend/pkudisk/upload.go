@@ -176,6 +176,10 @@ func (c *apiClient) uploadMultipart(ctx context.Context, parentID, name, existin
 		return fileMetadata{}, fmt.Errorf("multipart upload consumed unexpected byte count: %d remain", remaining)
 	}
 
+	return c.finishMultipartUpload(ctx, init, existingRev, partInfo, objectHTTP)
+}
+
+func (c *apiClient) finishMultipartUpload(ctx context.Context, init multipartInit, existingRev string, partInfo map[string][]any, objectHTTP *http.Client) (fileMetadata, error) {
 	completion, err := c.do(ctx, http.MethodPost, "efast/v1/file/oscompleteupload", map[string]any{
 		"partinfo": partInfo,
 		"docid":    init.DocID,

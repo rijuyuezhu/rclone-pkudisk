@@ -14,7 +14,7 @@ The backend currently supports the operations needed for ordinary file transfer 
 - list document libraries, directories, and files
 - create and remove directories, including native recursive purge of non-empty directory trees
 - upload new files and update existing files as AnyShare revisions
-- signed single uploads and multipart uploads
+- signed single uploads and multipart uploads, with rclone-native concurrent chunk uploads for large files
 - downloads and ranged reads
 - remove files
 - server-side file and directory moves
@@ -213,7 +213,7 @@ The default encoding covers Windows-style reserved characters, control character
 
 ## Upload and download behavior
 
-Uploads require a known object size. Small files use AnyShare's signed single-upload flow; larger files use its multipart flow while streaming the source rather than buffering the whole object in memory.
+Uploads require a known object size. Small files use AnyShare's signed single-upload flow; larger files use its multipart flow while streaming the source rather than buffering the whole object in memory. When rclone selects its multi-thread copy path (256 MiB and above by default), the backend exposes AnyShare multipart parts through `OpenChunkWriter`, so rclone can upload independent parts concurrently. The usual rclone `--multi-thread-cutoff` and `--multi-thread-streams` controls determine when the multi-thread path is considered; the backend currently advertises four-way multipart concurrency.
 
 Downloads use signed AnyShare object-storage URLs and support rclone range requests. The backend also bundles the TrustAsia intermediate certificate needed on systems where the PKU object-storage endpoint does not serve that intermediate in its certificate chain.
 
