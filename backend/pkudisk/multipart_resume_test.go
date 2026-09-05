@@ -211,7 +211,7 @@ func TestChunkWriterFinalizationFailureDiscardsAmbiguousResumeState(t *testing.T
 	}
 
 	writer := &pkudiskChunkWriter{
-		api:         newAPIClient(server.URL, &staticTokenProvider{token: "test-token"}),
+		api:         mustNewAPIClient(t, context.Background(), server.URL, &staticTokenProvider{token: "test-token"}),
 		objectHTTP:  server.Client(),
 		init:        state.Init,
 		size:        8,

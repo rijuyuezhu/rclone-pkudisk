@@ -12,6 +12,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/rclone/rclone/fs/fshttp"
 )
 
 const defaultBaseURL = "https://disk.pku.edu.cn"
@@ -48,6 +50,7 @@ type apiClient struct {
 	baseURL             string
 	http                *http.Client
 	recursiveDeleteHTTP *http.Client
+	objectHTTP          *http.Client
 	tokens              tokenProvider
 }
 
@@ -126,20 +129,25 @@ func (e *apiError) Error() string {
 	return fmt.Sprintf("PKU Disk API error: HTTP %d: %s", e.Status, e.Msg)
 }
 
-func newAPIClient(baseURL string, tokens tokenProvider) *apiClient {
+func newAPIClient(ctx context.Context, baseURL string, tokens tokenProvider) (*apiClient, error) {
 	if strings.TrimSpace(baseURL) == "" {
 		baseURL = defaultBaseURL
 	}
-	return &apiClient{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		http: &http.Client{
-			Timeout: defaultAPITimeout,
-		},
-		recursiveDeleteHTTP: &http.Client{
-			Timeout: recursiveDeleteTimeout,
-		},
-		tokens: tokens,
+	apiHTTP := fshttp.NewClient(ctx)
+	apiHTTP.Timeout = defaultAPITimeout
+	recursiveDeleteHTTP := *apiHTTP
+	recursiveDeleteHTTP.Timeout = recursiveDeleteTimeout
+	objectHTTP, err := newObjectHTTPClient(ctx)
+	if err != nil {
+		return nil, err
 	}
+	return &apiClient{
+		baseURL:             strings.TrimRight(baseURL, "/"),
+		http:                apiHTTP,
+		recursiveDeleteHTTP: &recursiveDeleteHTTP,
+		objectHTTP:          objectHTTP,
+		tokens:              tokens,
+	}, nil
 }
 
 func (c *apiClient) endpoint(path string) string {

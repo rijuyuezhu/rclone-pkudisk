@@ -53,7 +53,7 @@ func TestSingleUploadStreamsSignedForm(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := newAPIClient(server.URL, &staticTokenProvider{token: "test-token"})
+	client := mustNewAPIClient(t, context.Background(), server.URL, &staticTokenProvider{token: "test-token"})
 	meta, err := client.uploadSingle(context.Background(), "gns://lib", "hello.txt", "", "", 5, time.Unix(1_788_000_000, 0), strings.NewReader("hello"))
 	if err != nil {
 		t.Fatal(err)
@@ -93,7 +93,7 @@ func TestExistingFileUploadCreatesVersionWithEditedRev(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := newAPIClient(server.URL, &staticTokenProvider{token: "test-token"})
+	client := mustNewAPIClient(t, context.Background(), server.URL, &staticTokenProvider{token: "test-token"})
 	_, err := client.uploadSingle(context.Background(), "gns://lib", "file.txt", "gns://lib/existing", "rev-old", 7, time.Now(), strings.NewReader("updated"))
 	if err != nil {
 		t.Fatal(err)
@@ -166,7 +166,7 @@ func TestMultipartUploadStreamsPartsAndCompletes(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := newAPIClient(server.URL, &staticTokenProvider{token: "test-token"})
+	client := mustNewAPIClient(t, context.Background(), server.URL, &staticTokenProvider{token: "test-token"})
 	meta, err := client.uploadMultipart(context.Background(), "gns://lib", "large.bin", "", "", int64(len(payload)), time.Now(), bytes.NewReader(payload))
 	if err != nil {
 		t.Fatal(err)

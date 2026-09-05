@@ -81,7 +81,7 @@ func TestChunkWriterUploadsOutOfOrderAndCompletes(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := newAPIClient(server.URL, &staticTokenProvider{token: "test-token"})
+	client := mustNewAPIClient(t, context.Background(), server.URL, &staticTokenProvider{token: "test-token"})
 	writer := &pkudiskChunkWriter{
 		api:         client,
 		objectHTTP:  server.Client(),

@@ -175,10 +175,6 @@ func (c *apiClient) uploadMultipart(ctx context.Context, parentID, name, existin
 		return fileMetadata{}, err
 	}
 
-	objectHTTP, err := newObjectHTTPClient()
-	if err != nil {
-		return fileMetadata{}, err
-	}
 	partInfo := make(map[string][]any, partCount)
 	remaining := size
 	for part := int64(1); part <= partCount; part++ {
@@ -194,7 +190,7 @@ func (c *apiClient) uploadMultipart(ctx context.Context, parentID, name, existin
 		}
 		req.ContentLength = chunkSize
 		req.Header = signed.headers.Clone()
-		resp, err := objectHTTP.Do(req)
+		resp, err := c.objectHTTP.Do(req)
 		if err != nil {
 			return fileMetadata{}, fmt.Errorf("upload multipart part %d: %w", part, err)
 		}
@@ -214,7 +210,7 @@ func (c *apiClient) uploadMultipart(ctx context.Context, parentID, name, existin
 		return fileMetadata{}, fmt.Errorf("multipart upload consumed unexpected byte count: %d remain", remaining)
 	}
 
-	return c.finishMultipartUpload(ctx, init, existingRev, partInfo, objectHTTP)
+	return c.finishMultipartUpload(ctx, init, existingRev, partInfo, c.objectHTTP)
 }
 
 func (c *apiClient) finishMultipartUpload(ctx context.Context, init multipartInit, existingRev string, partInfo map[string][]any, objectHTTP *http.Client) (fileMetadata, error) {
@@ -342,11 +338,7 @@ func (c *apiClient) executeFormUpload(ctx context.Context, signed signedRequest,
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	req.ContentLength = int64(len(prefix)) + size + int64(len(suffix))
-	client, err := newObjectHTTPClient()
-	if err != nil {
-		return err
-	}
-	resp, err := client.Do(req)
+	resp, err := c.objectHTTP.Do(req)
 	if err != nil {
 		return fmt.Errorf("upload to PKU object storage: %w", err)
 	}

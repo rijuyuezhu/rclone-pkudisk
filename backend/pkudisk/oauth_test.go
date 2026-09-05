@@ -15,10 +15,19 @@ import (
 
 func TestConfigureOAuthRegistersOnce(t *testing.T) {
 	var calls atomic.Int32
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.UserAgent = "pkudisk-oauth-fshttp-test"
+	ci.Headers = []*fs.HTTPOption{{Key: "X-PKUDisk-Test", Value: "oauth"}}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/oauth2/clients" {
 			http.NotFound(w, r)
 			return
+		}
+		if got := r.UserAgent(); got != ci.UserAgent {
+			t.Fatalf("user agent = %q, want %q", got, ci.UserAgent)
+		}
+		if got := r.Header.Get("X-PKUDisk-Test"); got != "oauth" {
+			t.Fatalf("custom header = %q, want oauth", got)
 		}
 		calls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
@@ -30,7 +39,7 @@ func TestConfigureOAuthRegistersOnce(t *testing.T) {
 	defer server.Close()
 
 	m := configmap.Simple{"auth": "oauth", "base_url": server.URL}
-	out, err := configureOAuth(context.Background(), "pku", m, fs.ConfigIn{})
+	out, err := configureOAuth(ctx, "pku", m, fs.ConfigIn{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +59,7 @@ func TestConfigureOAuthRegistersOnce(t *testing.T) {
 		t.Fatalf("udid length = %d, want 32", len(got))
 	}
 
-	if _, err := configureOAuth(context.Background(), "pku", m, fs.ConfigIn{}); err != nil {
+	if _, err := configureOAuth(ctx, "pku", m, fs.ConfigIn{}); err != nil {
 		t.Fatal(err)
 	}
 	if calls.Load() != 1 {

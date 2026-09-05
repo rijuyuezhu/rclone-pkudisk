@@ -84,7 +84,7 @@ func TestNewObjectUsesGetInfoByPath(t *testing.T) {
 	f := &Fs{
 		root: "Library/dir",
 		opt:  Options{Enc: defaultEncoding},
-		api:  newAPIClient(server.URL, &staticTokenProvider{token: "test-token"}),
+		api:  mustNewAPIClient(t, context.Background(), server.URL, &staticTokenProvider{token: "test-token"}),
 	}
 	object, err := f.NewObject(context.Background(), "file.txt")
 	if err != nil {
@@ -119,7 +119,7 @@ func TestNewObjectMapsGetInfoNotFound(t *testing.T) {
 	f := &Fs{
 		root: "Library/dir",
 		opt:  Options{Enc: defaultEncoding},
-		api:  newAPIClient(server.URL, &staticTokenProvider{token: "test-token"}),
+		api:  mustNewAPIClient(t, context.Background(), server.URL, &staticTokenProvider{token: "test-token"}),
 	}
 	_, err := f.NewObject(context.Background(), "missing.txt")
 	if !errors.Is(err, fs.ErrorObjectNotFound) {

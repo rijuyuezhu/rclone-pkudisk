@@ -2,12 +2,19 @@ package pkudisk
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
+	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/fshttp"
 )
 
 type rotatingTokenProvider struct {
@@ -43,7 +50,7 @@ func TestAPIClientRetriesObservedAuthSessionCodes(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := newAPIClient(server.URL, provider)
+	client := mustNewAPIClient(t, context.Background(), server.URL, provider)
 	var result struct {
 		OK bool `json:"ok"`
 	}
@@ -73,7 +80,7 @@ func TestListDirRetriesTransientServerError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := newAPIClient(server.URL, &staticTokenProvider{token: "test-token"})
+	client := mustNewAPIClient(t, context.Background(), server.URL, &staticTokenProvider{token: "test-token"})
 	if _, err := client.listDir(context.Background(), "gns://dir"); err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +99,7 @@ func TestListDirRetriesRequestTimeout(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := newAPIClient(server.URL, &staticTokenProvider{token: "test-token"})
+	client := mustNewAPIClient(t, context.Background(), server.URL, &staticTokenProvider{token: "test-token"})
 	client.http.Timeout = 10 * time.Millisecond
 	if _, err := client.listDir(context.Background(), "gns://dir"); err != nil {
 		t.Fatal(err)
@@ -120,7 +127,7 @@ func TestDirectoryDeleteUsesLongerHTTPTimeout(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := newAPIClient(server.URL, &staticTokenProvider{token: "test-token"})
+	client := mustNewAPIClient(t, context.Background(), server.URL, &staticTokenProvider{token: "test-token"})
 	client.http.Timeout = 5 * time.Millisecond
 	client.recursiveDeleteHTTP.Timeout = 100 * time.Millisecond
 
@@ -132,19 +139,101 @@ func TestDirectoryDeleteUsesLongerHTTPTimeout(t *testing.T) {
 	}
 }
 
-func TestObjectHTTPClientIsSharedWithoutWholeTransferTimeout(t *testing.T) {
-	client, err := newObjectHTTPClient()
+func TestAPIClientUsesRcloneHTTPConfig(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.UserAgent = "pkudisk-api-fshttp-test"
+	ci.Headers = []*fs.HTTPOption{{Key: "X-PKUDisk-Test", Value: "api"}}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.UserAgent(); got != ci.UserAgent {
+			t.Fatalf("user agent = %q, want %q", got, ci.UserAgent)
+		}
+		if got := r.Header.Get("X-PKUDisk-Test"); got != "api" {
+			t.Fatalf("custom header = %q, want api", got)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"dirs": []any{}, "files": []any{}})
+	}))
+	defer server.Close()
+
+	client := mustNewAPIClient(t, ctx, server.URL, &staticTokenProvider{token: "test-token"})
+	if _, err := client.listDir(ctx, "gns://dir"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestObjectHTTPClientUsesRcloneTransportWithoutWholeTransferTimeout(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.UserAgent = "pkudisk-object-fshttp-test"
+	ci.Headers = []*fs.HTTPOption{{Key: "X-PKUDisk-Test", Value: "object"}}
+	ci.InsecureSkipVerify = true
+
+	client, err := newObjectHTTPClient(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	again, err := newObjectHTTPClient()
-	if err != nil {
-		t.Fatal(err)
+	transport, ok := client.Transport.(*fshttp.Transport)
+	if !ok {
+		t.Fatalf("object transport type = %T, want *fshttp.Transport", client.Transport)
 	}
-	if client != again {
-		t.Fatal("object HTTP client is not shared across transfers")
+	if !transport.TLSClientConfig.InsecureSkipVerify {
+		t.Fatal("object transport lost rclone InsecureSkipVerify setting")
+	}
+	if transport.TLSClientConfig.MinVersion < tls.VersionTLS12 {
+		t.Fatalf("object TLS minimum = %d, want TLS 1.2 or newer", transport.TLSClientConfig.MinVersion)
+	}
+	if transport.TLSClientConfig.RootCAs == nil {
+		t.Fatal("object transport has no CA pool after TrustAsia augmentation")
 	}
 	if client.Timeout != 0 {
 		t.Fatalf("object client timeout = %s, want no wall-clock timeout", client.Timeout)
 	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.UserAgent(); got != ci.UserAgent {
+			t.Fatalf("user agent = %q, want %q", got, ci.UserAgent)
+		}
+		if got := r.Header.Get("X-PKUDisk-Test"); got != "object" {
+			t.Fatalf("custom header = %q, want object", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+}
+
+func TestObjectHTTPClientPreservesRcloneCACertPool(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	certFile := filepath.Join(t.TempDir(), "test-ca.pem")
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw})
+	if err := os.WriteFile(certFile, certPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.InsecureSkipVerify = false
+	ci.CaCert = []string{certFile}
+	client, err := newObjectHTTPClient(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("object client lost rclone --ca-cert trust while adding TrustAsia CA: %v", err)
+	}
+	resp.Body.Close()
 }
