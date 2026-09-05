@@ -16,6 +16,7 @@ import (
 func TestMultipartResumeStateIdentityAndMissingRanges(t *testing.T) {
 	modTime := time.Unix(1_800_000_000, 123_456_789)
 	state := newMultipartResumeState(
+		"source-a",
 		45,
 		modTime,
 		"old-id",
@@ -27,19 +28,43 @@ func TestMultipartResumeStateIdentityAndMissingRanges(t *testing.T) {
 	state.Completed["1"] = multipartResumePart{ETag: "etag-1", Size: 20}
 	state.Completed["3"] = multipartResumePart{ETag: "etag-3", Size: 5}
 
-	if !state.validFor(45, modTime, "old-id", "old-rev", 20, 3) {
+	if !state.validFor("source-a", 45, modTime, "old-id", "old-rev", 20, 3) {
 		t.Fatal("valid resume state was rejected")
 	}
-	if state.validFor(45, modTime.Add(time.Nanosecond), "old-id", "old-rev", 20, 3) {
+	state.Version = multipartResumeVersion - 1
+	if state.validFor("source-a", 45, modTime, "old-id", "old-rev", 20, 3) {
+		t.Fatal("resume state accepted an older unsafe state version")
+	}
+	state.Version = multipartResumeVersion
+	if state.validFor("source-b", 45, modTime, "old-id", "old-rev", 20, 3) {
+		t.Fatal("resume state accepted a different source identity")
+	}
+	if state.validFor("source-a", 45, modTime.Add(time.Nanosecond), "old-id", "old-rev", 20, 3) {
 		t.Fatal("resume state accepted a changed source mtime")
 	}
-	if state.validFor(45, modTime, "old-id", "new-rev", 20, 3) {
+	if state.validFor("source-a", 45, modTime, "old-id", "new-rev", 20, 3) {
 		t.Fatal("resume state accepted a changed destination revision")
 	}
 
 	ranges := missingMultipartRanges(3, state.partInfo())
 	if len(ranges) != 1 || ranges[0] != "2" {
 		t.Fatalf("missing ranges = %v, want [2]", ranges)
+	}
+}
+
+func TestMultipartResumeSourceIdentityDistinguishesSameSizeAndModTimeSources(t *testing.T) {
+	ctx := context.Background()
+	modTime := time.Unix(1_800_000_050, 123_456_789)
+	srcA := object.NewStaticObjectInfo("A.bin", modTime, 100<<20, true, nil, nil)
+	srcB := object.NewStaticObjectInfo("B.bin", modTime, 100<<20, true, nil, nil)
+
+	idA := multipartResumeSourceIdentity(ctx, srcA)
+	idB := multipartResumeSourceIdentity(ctx, srcB)
+	if idA == idB {
+		t.Fatalf("different source paths with identical size/mtime share identity %q", idA)
+	}
+	if idA != multipartResumeSourceIdentity(ctx, srcA) {
+		t.Fatal("source identity is not stable")
 	}
 }
 
@@ -102,8 +127,9 @@ func TestOpenChunkWriterResumesCompletedPartWithoutReadingSource(t *testing.T) {
 	f := newCachedTestFs(t, ctx, server.URL)
 	f.resumeDir = t.TempDir()
 	remote := "Personal/dst/file.bin"
+	src := object.NewStaticObjectInfo("file.bin", modTime, totalSize, true, nil, nil)
 	state := newMultipartResumeState(
-		totalSize, modTime, "", "", partSize, 2,
+		multipartResumeSourceIdentity(ctx, src), totalSize, modTime, "", "", partSize, 2,
 		multipartInit{DocID: "gns://personal/dst/incomplete", Rev: "upload-rev", UploadID: "upload-id"},
 	)
 	state.Completed["1"] = multipartResumePart{ETag: "etag-1", Size: partSize}
@@ -116,7 +142,6 @@ func TestOpenChunkWriterResumesCompletedPartWithoutReadingSource(t *testing.T) {
 	}
 	store.release()
 
-	src := object.NewStaticObjectInfo("file.bin", modTime, totalSize, true, nil, nil)
 	info, writer, err := f.OpenChunkWriter(ctx, remote, src)
 	if err != nil {
 		t.Fatal(err)
@@ -172,7 +197,7 @@ func TestChunkWriterFinalizationFailureDiscardsAmbiguousResumeState(t *testing.T
 		t.Fatal("resume store unexpectedly disabled")
 	}
 	state := newMultipartResumeState(
-		8, time.Unix(1_800_000_200, 0), "", "", 8, 1,
+		"source", 8, time.Unix(1_800_000_200, 0), "", "", 8, 1,
 		multipartInit{DocID: "upload-doc", Rev: "upload-rev", UploadID: "upload-id"},
 	)
 	state.Completed["1"] = multipartResumePart{ETag: "etag-1", Size: 8}

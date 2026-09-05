@@ -45,6 +45,7 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		return info, nil, &fs.FileTooSmallError{MinSize: 1}
 	}
 	modTime := src.ModTime(ctx)
+	sourceIdentity := multipartResumeSourceIdentity(ctx, src)
 	resumeStore := f.openMultipartResumeStore(ctx, remote)
 	handedOffStore := false
 	defer func() {
@@ -103,7 +104,7 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		_ = resumeStore.remove()
 		state = nil
 	}
-	resumed := state != nil && state.validFor(size, modTime, existingID, existingRev, partSize, partCount)
+	resumed := state != nil && state.validFor(sourceIdentity, size, modTime, existingID, existingRev, partSize, partCount)
 	if state != nil && !resumed {
 		fs.Debugf(f, "discarding stale multipart resume state for %q", remote)
 		_ = resumeStore.remove()
@@ -124,7 +125,7 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		if err != nil {
 			return info, nil, err
 		}
-		state = newMultipartResumeState(size, modTime, existingID, existingRev, partSize, partCount, init)
+		state = newMultipartResumeState(sourceIdentity, size, modTime, existingID, existingRev, partSize, partCount, init)
 		if err := resumeStore.save(state); err != nil {
 			fs.Debugf(f, "persist initial multipart resume state for %q: %v", remote, err)
 		}
@@ -145,7 +146,7 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 				return info, nil, fmt.Errorf("resume multipart upload %q: sign remaining parts: %w; refresh failed: %v; fresh init failed: %w", remote, signErr, refreshErr, err)
 			}
 			partInfo = make(map[string][]any, partCount)
-			state = newMultipartResumeState(size, modTime, existingID, existingRev, partSize, partCount, init)
+			state = newMultipartResumeState(sourceIdentity, size, modTime, existingID, existingRev, partSize, partCount, init)
 			if err := resumeStore.save(state); err != nil {
 				fs.Debugf(f, "persist replacement multipart resume state for %q: %v", remote, err)
 			}
