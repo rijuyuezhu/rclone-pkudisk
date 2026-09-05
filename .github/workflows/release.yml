@@ -30,6 +30,13 @@ jobs:
             echo "release tag must match source version: expected $expected_tag, got $RELEASE_TAG" >&2
             exit 1
           fi
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          tag_commit=$(git rev-list -n 1 "$RELEASE_TAG")
+          main_commit=$(git rev-parse origin/main)
+          if ! git merge-base --is-ancestor "$tag_commit" "$main_commit"; then
+            echo "release tag commit $tag_commit is not on origin/main ($main_commit)" >&2
+            exit 1
+          fi
           targets=$(jq -R -s -c 'split("\n") | map(select(length > 0))' scripts/release-targets.txt)
           target_count=$(jq 'length' <<<"$targets")
           unique_target_count=$(jq 'unique | length' <<<"$targets")
@@ -54,6 +61,7 @@ jobs:
           go-version: '1.26.6'
           cache: true
       - run: go test ./...
+      - run: go test -race ./backend/pkudisk/...
       - run: go vet ./...
       - name: Verify release version and disabled self-update
         run: |
