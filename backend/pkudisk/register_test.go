@@ -12,15 +12,20 @@ import (
 )
 
 func TestRegistrationLogFilterOnlySuppressesMissingOverview(t *testing.T) {
+	const missingOverview = "internal error: no overview data found for \"pkudisk\""
+	if got := missingOverviewLogMessage("pkudisk"); got != missingOverview {
+		t.Fatalf("missing overview message = %q, want %q", got, missingOverview)
+	}
+
 	var buf bytes.Buffer
 	next := slog.NewTextHandler(&buf, nil)
 	h := registrationLogFilter{
 		Handler: next,
-		message: `internal error: no overview data found for "pkudisk"`,
+		message: missingOverviewLogMessage("pkudisk"),
 	}
 	ctx := context.Background()
 
-	if err := h.Handle(ctx, slog.NewRecord(time.Time{}, slog.LevelError, h.message, 0)); err != nil {
+	if err := h.Handle(ctx, slog.NewRecord(time.Time{}, slog.LevelError, missingOverview, 0)); err != nil {
 		t.Fatal(err)
 	}
 	if buf.Len() != 0 {

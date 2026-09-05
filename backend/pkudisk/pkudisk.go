@@ -23,6 +23,7 @@ import (
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/oauthutil"
+	"github.com/rclone/rclone/lib/rest"
 )
 
 const (
@@ -118,6 +119,10 @@ type registrationLogFilter struct {
 	message string
 }
 
+func missingOverviewLogMessage(name string) string {
+	return fmt.Sprintf("internal error: no overview data found for %q", name)
+}
+
 func (h registrationLogFilter) Handle(ctx context.Context, record slog.Record) error {
 	if record.Level == slog.LevelError && record.Message == h.message {
 		return nil
@@ -129,7 +134,7 @@ func registerBackend(info *fs.RegInfo) {
 	handler := rclonelog.Handler
 	fs.SetLogger(registrationLogFilter{
 		Handler: handler,
-		message: fmt.Sprintf("internal error: no overview data found for %q", info.Name),
+		message: missingOverviewLogMessage(info.Name),
 	})
 	fs.Register(info)
 	fs.SetLogger(handler)
@@ -669,6 +674,10 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		resp.Body.Close()
 		return nil, fmt.Errorf("download from PKU object storage: HTTP %d", resp.StatusCode)
+	}
+	if err := rest.CheckContentRange(resp, options, o.size); err != nil {
+		resp.Body.Close()
+		return nil, fmt.Errorf("download from PKU object storage: validate range response: %w", err)
 	}
 	return resp.Body, nil
 }
