@@ -3,6 +3,7 @@ package pkudisk
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -95,7 +96,8 @@ func TestChunkWriterUploadsOutOfOrderAndCompletes(t *testing.T) {
 			"2": {"PUT", server.URL + "/part/2"},
 			"3": {"PUT", server.URL + "/part/3"},
 		}},
-		partInfo: make(map[string][]any),
+		partInfo:    make(map[string][]any),
+		resumeState: &multipartResumeState{Completed: make(map[string]multipartResumePart)},
 	}
 
 	ctx := context.Background()
@@ -123,6 +125,12 @@ func TestChunkWriterUploadsOutOfOrderAndCompletes(t *testing.T) {
 	for part, want := range payloads {
 		if !bytes.Equal(gotParts[part], want) {
 			t.Fatalf("part %d = %q, want %q", part, gotParts[part], want)
+		}
+		key := strconv.Itoa(part)
+		persisted := writer.resumeState.Completed[key]
+		sum := sha256.Sum256(want)
+		if persisted.Size != int64(len(want)) || persisted.SHA256 != fmt.Sprintf("%x", sum[:]) {
+			t.Fatalf("resume digest for part %d = %#v", part, persisted)
 		}
 	}
 

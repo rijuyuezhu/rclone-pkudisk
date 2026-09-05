@@ -19,11 +19,12 @@ import (
 	"github.com/rclone/rclone/fs"
 )
 
-const multipartResumeVersion = 2
+const multipartResumeVersion = 3
 
 type multipartResumePart struct {
-	ETag string `json:"etag"`
-	Size int64  `json:"size"`
+	ETag   string `json:"etag"`
+	Size   int64  `json:"size"`
+	SHA256 string `json:"sha256"`
 }
 
 type multipartResumeState struct {
@@ -31,6 +32,8 @@ type multipartResumeState struct {
 	SourceIdentity string                         `json:"source_identity"`
 	Size           int64                          `json:"size"`
 	ModTimeNsec    int64                          `json:"mod_time_nsec"`
+	ParentID       string                         `json:"parent_id"`
+	EncodedLeaf    string                         `json:"encoded_leaf"`
 	ExistingID     string                         `json:"existing_id,omitempty"`
 	ExistingRev    string                         `json:"existing_rev,omitempty"`
 	PartSize       int64                          `json:"part_size"`
@@ -190,12 +193,14 @@ func (s *multipartResumeStore) remove() error {
 	return err
 }
 
-func newMultipartResumeState(sourceIdentity string, size int64, modTime time.Time, existingID, existingRev string, partSize, partCount int64, init multipartInit) *multipartResumeState {
+func newMultipartResumeState(sourceIdentity string, size int64, modTime time.Time, parentID, encodedLeaf, existingID, existingRev string, partSize, partCount int64, init multipartInit) *multipartResumeState {
 	return &multipartResumeState{
 		Version:        multipartResumeVersion,
 		SourceIdentity: sourceIdentity,
 		Size:           size,
 		ModTimeNsec:    modTime.UnixNano(),
+		ParentID:       parentID,
+		EncodedLeaf:    encodedLeaf,
 		ExistingID:     existingID,
 		ExistingRev:    existingRev,
 		PartSize:       partSize,
@@ -205,10 +210,11 @@ func newMultipartResumeState(sourceIdentity string, size int64, modTime time.Tim
 	}
 }
 
-func (s *multipartResumeState) validFor(sourceIdentity string, size int64, modTime time.Time, existingID, existingRev string, partSize, partCount int64) bool {
+func (s *multipartResumeState) validFor(sourceIdentity string, size int64, modTime time.Time, parentID, encodedLeaf, existingID, existingRev string, partSize, partCount int64) bool {
 	if s == nil || s.Version != multipartResumeVersion ||
 		s.SourceIdentity == "" || s.SourceIdentity != sourceIdentity ||
 		s.Size != size || s.ModTimeNsec != modTime.UnixNano() ||
+		s.ParentID == "" || s.ParentID != parentID || s.EncodedLeaf != encodedLeaf ||
 		s.ExistingID != existingID || s.ExistingRev != existingRev ||
 		s.PartSize != partSize || s.PartCount != partCount ||
 		s.Init.DocID == "" || s.Init.Rev == "" || s.Init.UploadID == "" {
@@ -217,6 +223,10 @@ func (s *multipartResumeState) validFor(sourceIdentity string, size int64, modTi
 	for key, part := range s.Completed {
 		n, err := strconv.ParseInt(key, 10, 64)
 		if err != nil || n < 1 || n > partCount || part.ETag == "" {
+			return false
+		}
+		digest, err := hex.DecodeString(part.SHA256)
+		if err != nil || len(digest) != sha256.Size {
 			return false
 		}
 		wantSize := min(partSize, size-(n-1)*partSize)

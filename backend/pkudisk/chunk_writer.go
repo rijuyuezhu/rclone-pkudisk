@@ -2,6 +2,8 @@ package pkudisk
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/fserrors"
 )
 
 const defaultUploadConcurrency = 4
@@ -27,11 +30,21 @@ type pkudiskChunkWriter struct {
 	partSize    int64
 	partCount   int64
 	signedParts multipartSignedParts
+	// resumeSource is retained only for local sources. It lets completed-part
+	// verification read the current local bytes at WriteChunk time without
+	// consuming rclone's accounted transfer reader, so user-visible transferred
+	// bytes continue to represent the network data that actually needs upload.
+	resumeSource fs.Object
 
 	mu       sync.Mutex
 	partInfo map[string][]any
 	closed   bool
 	aborted  bool
+	// resumeInvalid distinguishes an ordinary Abort from a content mismatch
+	// that must force rclone to retry the whole copy with a fresh multipart
+	// session. Concurrent part writers must all surface a retryable error once
+	// this is set so errgroup ordering cannot hide the restart request.
+	resumeInvalid bool
 
 	resumeStore *multipartResumeStore
 	resumeState *multipartResumeState
@@ -61,6 +74,7 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 	if parentID == virtualRootID {
 		return info, nil, errors.New("files cannot be uploaded directly into the PKU Disk virtual root")
 	}
+	encodedLeaf := f.encodeName(leaf)
 
 	var existingID, existingRev string
 	existing, existingErr := f.NewObject(ctx, remote)
@@ -83,7 +97,7 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		var fresh multipartInit
 		if err := f.api.doJSON(ctx, http.MethodPost, "efast/v1/file/osinitmultiupload", uploadStartBody(
 			parentID,
-			f.encodeName(leaf),
+			encodedLeaf,
 			existingID,
 			existingRev,
 			size,
@@ -104,7 +118,7 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		_ = resumeStore.remove()
 		state = nil
 	}
-	resumed := state != nil && state.validFor(sourceIdentity, size, modTime, existingID, existingRev, partSize, partCount)
+	resumed := state != nil && state.validFor(sourceIdentity, size, modTime, parentID, encodedLeaf, existingID, existingRev, partSize, partCount)
 	if state != nil && !resumed {
 		fs.Debugf(f, "discarding stale multipart resume state for %q", remote)
 		_ = resumeStore.remove()
@@ -125,7 +139,7 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		if err != nil {
 			return info, nil, err
 		}
-		state = newMultipartResumeState(sourceIdentity, size, modTime, existingID, existingRev, partSize, partCount, init)
+		state = newMultipartResumeState(sourceIdentity, size, modTime, parentID, encodedLeaf, existingID, existingRev, partSize, partCount, init)
 		if err := resumeStore.save(state); err != nil {
 			fs.Debugf(f, "persist initial multipart resume state for %q: %v", remote, err)
 		}
@@ -146,7 +160,7 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 				return info, nil, fmt.Errorf("resume multipart upload %q: sign remaining parts: %w; refresh failed: %v; fresh init failed: %w", remote, signErr, refreshErr, err)
 			}
 			partInfo = make(map[string][]any, partCount)
-			state = newMultipartResumeState(sourceIdentity, size, modTime, existingID, existingRev, partSize, partCount, init)
+			state = newMultipartResumeState(sourceIdentity, size, modTime, parentID, encodedLeaf, existingID, existingRev, partSize, partCount, init)
 			if err := resumeStore.save(state); err != nil {
 				fs.Debugf(f, "persist replacement multipart resume state for %q: %v", remote, err)
 			}
@@ -194,6 +208,11 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		resumeStore: resumeStore,
 		resumeState: state,
 	}
+	if sourceFs := src.Fs(); sourceFs != nil && sourceFs.Features().IsLocal {
+		if obj, ok := src.(fs.Object); ok {
+			cw.resumeSource = obj
+		}
+	}
 	handedOffStore = true
 	concurrency := f.opt.UploadConcurrency
 	if concurrency < 1 {
@@ -223,12 +242,55 @@ func (w *pkudiskChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, re
 		return 0, errors.New("PKU Disk multipart writer is already closed")
 	}
 	if w.aborted {
+		resumeInvalid := w.resumeInvalid
 		w.mu.Unlock()
+		if resumeInvalid {
+			return 0, fserrors.RetryErrorf("PKU Disk multipart resume source changed; restarting upload")
+		}
 		return 0, errors.New("PKU Disk multipart writer is aborted")
 	}
-	if _, done := w.partInfo[partKey]; done {
+	var persisted multipartResumePart
+	done := false
+	if w.resumeState != nil {
+		persisted, done = w.resumeState.Completed[partKey]
+	}
+	if done {
 		w.mu.Unlock()
-		fs.Debugf(nil, "PKU Disk multipart resume: skipping completed part %d/%d", part, w.partCount)
+		var verifyReader io.Reader = reader
+		var closeVerifyReader io.Closer
+		if w.resumeSource != nil {
+			start := int64(chunkNumber) * w.partSize
+			r, err := w.resumeSource.Open(ctx, &fs.RangeOption{Start: start, End: start + expected - 1})
+			if err != nil {
+				return 0, fmt.Errorf("open completed multipart part %d for resume verification: %w", part, err)
+			}
+			verifyReader = r
+			closeVerifyReader = r
+		} else if _, err := reader.Seek(0, io.SeekStart); err != nil {
+			return 0, fmt.Errorf("seek completed multipart part %d for resume verification: %w", part, err)
+		}
+		h := sha256.New()
+		n, err := io.CopyN(h, verifyReader, expected)
+		if closeVerifyReader != nil {
+			closeErr := closeVerifyReader.Close()
+			if err == nil && closeErr != nil {
+				err = closeErr
+			}
+		}
+		if err != nil {
+			return 0, fmt.Errorf("hash completed multipart part %d for resume verification after %d bytes: %w", part, n, err)
+		}
+		if hex.EncodeToString(h.Sum(nil)) != persisted.SHA256 {
+			w.mu.Lock()
+			w.aborted = true
+			w.resumeInvalid = true
+			w.mu.Unlock()
+			if err := w.resumeStore.remove(); err != nil {
+				fs.Debugf(nil, "remove changed-source multipart resume state: %v", err)
+			}
+			return 0, fserrors.RetryErrorf("PKU Disk multipart resume source changed in completed part %d; restarting upload", part)
+		}
+		fs.Debugf(nil, "PKU Disk multipart resume: verified completed part %d/%d", part, w.partCount)
 		return expected, nil
 	}
 	w.mu.Unlock()
@@ -241,7 +303,9 @@ func (w *pkudiskChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, re
 	if _, err := reader.Seek(0, io.SeekStart); err != nil {
 		return 0, fmt.Errorf("seek multipart part %d: %w", part, err)
 	}
-	req, err := http.NewRequestWithContext(ctx, signed.method, signed.url, io.LimitReader(reader, expected))
+	h := sha256.New()
+	limited := &io.LimitedReader{R: reader, N: expected}
+	req, err := http.NewRequestWithContext(ctx, signed.method, signed.url, io.TeeReader(limited, h))
 	if err != nil {
 		return 0, err
 	}
@@ -256,6 +320,9 @@ func (w *pkudiskChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, re
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return 0, fmt.Errorf("upload multipart part %d: HTTP %d", part, resp.StatusCode)
 	}
+	if limited.N != 0 {
+		return 0, fmt.Errorf("upload multipart part %d: source ended %d bytes early", part, limited.N)
+	}
 	etag := resp.Header.Get("ETag")
 	if etag == "" {
 		return 0, fmt.Errorf("upload multipart part %d: missing ETag", part)
@@ -264,11 +331,18 @@ func (w *pkudiskChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, re
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed || w.aborted {
+		if w.resumeInvalid {
+			return 0, fserrors.RetryErrorf("PKU Disk multipart resume source changed; restarting upload")
+		}
 		return 0, errors.New("PKU Disk multipart writer changed state while uploading a part")
 	}
 	w.partInfo[partKey] = []any{etag, expected}
 	if w.resumeState != nil {
-		w.resumeState.Completed[partKey] = multipartResumePart{ETag: etag, Size: expected}
+		w.resumeState.Completed[partKey] = multipartResumePart{
+			ETag:   etag,
+			Size:   expected,
+			SHA256: hex.EncodeToString(h.Sum(nil)),
+		}
 		if err := w.resumeStore.save(w.resumeState); err != nil {
 			fs.Debugf(nil, "persist PKU Disk multipart resume state after part %d: %v", part, err)
 		}
