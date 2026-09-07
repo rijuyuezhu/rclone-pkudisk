@@ -40,9 +40,11 @@ const (
 		encoder.EncodeRightPeriod |
 		encoder.EncodeInvalidUtf8
 
-	metadataRevisionKey        = "rev"
-	syncExpectedIDMetadataKey  = "pkudisk-sync-expected-id"
-	syncExpectedRevMetadataKey = "pkudisk-sync-expected-rev"
+	metadataRevisionKey           = "rev"
+	syncExpectedIDMetadataKey     = "pkudisk-sync-expected-id"
+	syncExpectedRevMetadataKey    = "pkudisk-sync-expected-rev"
+	syncExpectedIDDownloadHeader  = "X-PKUDisk-Sync-Expected-ID"
+	syncExpectedRevDownloadHeader = "X-PKUDisk-Sync-Expected-Rev"
 )
 
 var metadataInfo = &fs.MetadataInfo{
@@ -756,7 +758,63 @@ func (o *Object) SetModTime(context.Context, time.Time) error {
 	return fs.ErrorCantSetModTime
 }
 
+type syncDownloadPreconditions struct {
+	expectedID  string
+	expectedRev string
+	set         bool
+}
+
+func extractSyncDownloadPreconditions(options []fs.OpenOption) (syncDownloadPreconditions, []fs.OpenOption, error) {
+	var p syncDownloadPreconditions
+	var idSet, revSet bool
+	forwarded := make([]fs.OpenOption, 0, len(options))
+	for _, option := range options {
+		header, ok := option.(*fs.HTTPOption)
+		if !ok {
+			forwarded = append(forwarded, option)
+			continue
+		}
+		key := strings.TrimSpace(header.Key)
+		switch {
+		case strings.EqualFold(key, syncExpectedIDDownloadHeader):
+			value := strings.TrimSpace(header.Value)
+			if value == "" {
+				return p, nil, syncPreconditionErrorf("%s must not be empty", syncExpectedIDDownloadHeader)
+			}
+			if idSet && p.expectedID != value {
+				return p, nil, syncPreconditionErrorf("conflicting %s values", syncExpectedIDDownloadHeader)
+			}
+			p.expectedID = value
+			idSet = true
+			continue
+		case strings.EqualFold(key, syncExpectedRevDownloadHeader):
+			value := strings.TrimSpace(header.Value)
+			if value == "" {
+				return p, nil, syncPreconditionErrorf("%s must not be empty", syncExpectedRevDownloadHeader)
+			}
+			if revSet && p.expectedRev != value {
+				return p, nil, syncPreconditionErrorf("conflicting %s values", syncExpectedRevDownloadHeader)
+			}
+			p.expectedRev = value
+			revSet = true
+			continue
+		default:
+			forwarded = append(forwarded, option)
+		}
+	}
+	if idSet != revSet {
+		return p, nil, syncPreconditionErrorf("%s and %s must be supplied together", syncExpectedIDDownloadHeader, syncExpectedRevDownloadHeader)
+	}
+	p.set = idSet
+	return p, forwarded, nil
+}
+
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	preconditions, forwarded, err := extractSyncDownloadPreconditions(options)
+	if err != nil {
+		return nil, err
+	}
+	options = forwarded
 	meta := fileMetadata{
 		DocID: o.id,
 		Name:  o.fs.encodeName(path.Base(o.remote)),
@@ -769,6 +827,14 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 			return nil, err
 		}
 		meta = fresh
+	}
+	if preconditions.set {
+		if meta.DocID != preconditions.expectedID {
+			return nil, syncPreconditionErrorf("remote object ID changed: expected %q, got %q", preconditions.expectedID, meta.DocID)
+		}
+		if meta.Rev != preconditions.expectedRev {
+			return nil, syncPreconditionErrorf("remote revision changed for %q: expected %q, got %q", meta.DocID, preconditions.expectedRev, meta.Rev)
+		}
 	}
 	signedURL, err := o.fs.api.downloadURL(ctx, meta)
 	if err != nil {

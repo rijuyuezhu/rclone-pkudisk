@@ -3,6 +3,7 @@ package pkudisk
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -127,6 +128,125 @@ func TestExtractSyncUploadPreconditions(t *testing.T) {
 				t.Fatalf("preconditions = %#v, want %#v", got, test.want)
 			}
 		})
+	}
+}
+
+func TestExtractSyncDownloadPreconditions(t *testing.T) {
+	options := []fs.OpenOption{
+		&fs.HTTPOption{Key: strings.ToLower(syncExpectedIDDownloadHeader), Value: "gns://personal/file"},
+		&fs.HTTPOption{Key: syncExpectedRevDownloadHeader, Value: "rev-a"},
+		&fs.HTTPOption{Key: "X-Unrelated", Value: "keep-me"},
+		&fs.RangeOption{Start: 0, End: 9},
+	}
+	got, forwarded, err := extractSyncDownloadPreconditions(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := syncDownloadPreconditions{expectedID: "gns://personal/file", expectedRev: "rev-a", set: true}
+	if got != want {
+		t.Fatalf("download preconditions = %#v, want %#v", got, want)
+	}
+	if len(forwarded) != 2 {
+		t.Fatalf("forwarded options = %#v, want unrelated header + range", forwarded)
+	}
+	if header, ok := forwarded[0].(*fs.HTTPOption); !ok || header.Key != "X-Unrelated" || header.Value != "keep-me" {
+		t.Fatalf("first forwarded option = %#v", forwarded[0])
+	}
+	if _, ok := forwarded[1].(*fs.RangeOption); !ok {
+		t.Fatalf("second forwarded option = %#v, want RangeOption", forwarded[1])
+	}
+
+	_, _, err = extractSyncDownloadPreconditions([]fs.OpenOption{
+		&fs.HTTPOption{Key: syncExpectedIDDownloadHeader, Value: "gns://personal/file"},
+	})
+	if err == nil || !fserrors.IsNoRetryError(err) {
+		t.Fatalf("missing download revision error = %v, want NoRetryError", err)
+	}
+
+	_, _, err = extractSyncDownloadPreconditions([]fs.OpenOption{
+		&fs.HTTPOption{Key: syncExpectedIDDownloadHeader, Value: "gns://personal/a"},
+		&fs.HTTPOption{Key: syncExpectedIDDownloadHeader, Value: "gns://personal/b"},
+		&fs.HTTPOption{Key: syncExpectedRevDownloadHeader, Value: "rev-a"},
+	})
+	if err == nil || !fserrors.IsNoRetryError(err) {
+		t.Fatalf("conflicting download ID error = %v, want NoRetryError", err)
+	}
+}
+
+func TestOpenUsesExactDownloadRevisionAndConsumesSyncHeaders(t *testing.T) {
+	ctx := context.Background()
+	payload := "exact revision bytes"
+	osDownloadCalls := 0
+	var osDownloadBody map[string]any
+	var objectHeaders http.Header
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/efast/v1/file/osdownload":
+			osDownloadCalls++
+			_ = json.NewDecoder(r.Body).Decode(&osDownloadBody)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"authrequest": []any{"GET", server.URL + "/object"},
+			})
+		case "/object":
+			objectHeaders = r.Header.Clone()
+			_, _ = w.Write([]byte(payload))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	api := mustNewAPIClient(t, ctx, server.URL, &staticTokenProvider{token: "test-token"})
+	api.objectHTTP = server.Client()
+	f := &Fs{name: "pku", opt: Options{Enc: defaultEncoding}, api: api}
+	o := &Object{
+		fs:      f,
+		remote:  "Personal/file.txt",
+		id:      "gns://personal/file",
+		size:    int64(len(payload)),
+		modTime: time.Unix(1, 0),
+		rev:     "rev-current",
+	}
+
+	staleOptions := []fs.OpenOption{
+		&fs.HTTPOption{Key: syncExpectedIDDownloadHeader, Value: o.id},
+		&fs.HTTPOption{Key: syncExpectedRevDownloadHeader, Value: "rev-stale"},
+	}
+	_, err := o.Open(ctx, staleOptions...)
+	if err == nil || !fserrors.IsNoRetryError(err) {
+		t.Fatalf("stale download error = %v, want NoRetryError", err)
+	}
+	if osDownloadCalls != 0 {
+		t.Fatalf("stale download made %d osdownload calls", osDownloadCalls)
+	}
+
+	options := []fs.OpenOption{
+		&fs.HTTPOption{Key: syncExpectedIDDownloadHeader, Value: o.id},
+		&fs.HTTPOption{Key: syncExpectedRevDownloadHeader, Value: o.rev},
+		&fs.HTTPOption{Key: "X-Unrelated", Value: "forwarded"},
+	}
+	r, err := o.Open(ctx, options...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	buf := new(strings.Builder)
+	if _, err := io.Copy(buf, r); err != nil {
+		t.Fatal(err)
+	}
+	if buf.String() != payload {
+		t.Fatalf("downloaded %q, want %q", buf.String(), payload)
+	}
+	if osDownloadCalls != 1 || osDownloadBody["docid"] != o.id || osDownloadBody["rev"] != o.rev {
+		t.Fatalf("osdownload body = %#v, calls=%d", osDownloadBody, osDownloadCalls)
+	}
+	if objectHeaders.Get(syncExpectedIDDownloadHeader) != "" || objectHeaders.Get(syncExpectedRevDownloadHeader) != "" {
+		t.Fatalf("sync download headers leaked to object storage: %#v", objectHeaders)
+	}
+	if got := objectHeaders.Get("X-Unrelated"); got != "forwarded" {
+		t.Fatalf("unrelated header = %q, want forwarded", got)
 	}
 }
 
