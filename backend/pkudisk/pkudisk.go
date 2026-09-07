@@ -18,6 +18,7 @@ import (
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/hash"
 	rclonelog "github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/lib/dircache"
@@ -38,14 +39,47 @@ const (
 		encoder.EncodeRightSpace |
 		encoder.EncodeRightPeriod |
 		encoder.EncodeInvalidUtf8
+
+	metadataRevisionKey           = "rev"
+	syncExpectedIDMetadataKey     = "pkudisk-sync-expected-id"
+	syncExpectedRevMetadataKey    = "pkudisk-sync-expected-rev"
+	syncExpectedAbsentMetadataKey = "pkudisk-sync-expected-absent"
+	syncExpectedIDDownloadHeader  = "X-PKUDisk-Sync-Expected-ID"
+	syncExpectedRevDownloadHeader = "X-PKUDisk-Sync-Expected-Rev"
 )
+
+var metadataInfo = &fs.MetadataInfo{
+	System: map[string]fs.MetadataHelp{
+		metadataRevisionKey: {
+			Help:     "AnyShare revision identifier for optimistic concurrency.",
+			Type:     "string",
+			ReadOnly: true,
+		},
+	},
+	Help: "PKU Disk exposes the current AnyShare revision as read-only system metadata.",
+}
 
 func init() {
 	registerBackend(&fs.RegInfo{
-		Name:        "pkudisk",
-		Description: "Peking University PKU Disk (AnyShare)",
-		NewFs:       NewFs,
-		Config:      configureOAuth,
+		Name:         "pkudisk",
+		Description:  "Peking University PKU Disk (AnyShare)",
+		NewFs:        NewFs,
+		Config:       configureOAuth,
+		MetadataInfo: metadataInfo,
+		CommandHelp: []fs.CommandHelp{
+			{
+				Name:  "sync-delete",
+				Short: "Delete an exact file ID after checking its expected revision.",
+				Long:  "Low-level primitive for stateful sync clients. The single argument is the AnyShare docid; -o expected-rev=<rev> is required. This avoids re-resolving a path to a different object before deletion.",
+				Opts:  map[string]string{"expected-rev": "required AnyShare revision expected immediately before deletion"},
+			},
+			{
+				Name:  "sync-move",
+				Short: "Move or rename an exact AnyShare object ID.",
+				Long:  "Low-level primitive for stateful sync clients. Arguments are <docid> <destination-remote>. The destination parent must already exist. Use -o kind=dir for a directory; the default kind is file.",
+				Opts:  map[string]string{"kind": "entry kind: file (default) or dir"},
+			},
+		},
 		Options: []fs.Option{
 			{
 				Name:    "auth",
@@ -385,12 +419,23 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	remote := src.Remote()
+	preconditions, err := extractSyncUploadPreconditions(options)
+	if err != nil {
+		return nil, err
+	}
 	if existing, err := f.NewObject(ctx, remote); err == nil {
+		o := existing.(*Object)
+		if err := preconditions.checkObject(o.id, o.rev); err != nil {
+			return nil, err
+		}
 		if err := existing.Update(ctx, in, src, options...); err != nil {
 			return nil, err
 		}
 		return existing, nil
 	} else if !errors.Is(err, fs.ErrorObjectNotFound) {
+		return nil, err
+	}
+	if err := preconditions.checkObject("", ""); err != nil {
 		return nil, err
 	}
 
@@ -618,6 +663,93 @@ func (f *Fs) relocateEntry(ctx context.Context, id, srcParentID, dstParentID, sr
 	return newID, nil
 }
 
+func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (any, error) {
+	switch name {
+	case "sync-delete":
+		if len(arg) != 1 {
+			return nil, errors.New("sync-delete requires exactly one docid argument")
+		}
+		id := strings.TrimSpace(arg[0])
+		expectedRev := strings.TrimSpace(opt["expected-rev"])
+		if id == "" || expectedRev == "" {
+			return nil, errors.New("sync-delete requires a non-empty docid and -o expected-rev=<rev>")
+		}
+		meta, err := f.api.metadata(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if meta.DocID != "" && meta.DocID != id {
+			return nil, syncPreconditionErrorf("remote object ID changed: expected %q, got %q", id, meta.DocID)
+		}
+		if meta.Rev != expectedRev {
+			return nil, syncPreconditionErrorf("remote revision changed for %q: expected %q, got %q", id, expectedRev, meta.Rev)
+		}
+		if err := f.api.deleteEntry(ctx, id, false); err != nil {
+			return nil, err
+		}
+		return map[string]any{"deleted": true, "id": id}, nil
+
+	case "sync-move":
+		if len(arg) != 2 {
+			return nil, errors.New("sync-move requires <docid> <destination-remote>")
+		}
+		id := strings.TrimSpace(arg[0])
+		dstRemote := strings.Trim(strings.TrimSpace(arg[1]), "/")
+		if id == "" || dstRemote == "" {
+			return nil, errors.New("sync-move requires non-empty docid and destination-remote arguments")
+		}
+		kind := strings.ToLower(strings.TrimSpace(opt["kind"]))
+		isDir := false
+		switch kind {
+		case "", "file":
+		case "dir":
+			isDir = true
+		default:
+			return nil, fmt.Errorf("sync-move kind must be file or dir, got %q", kind)
+		}
+
+		dstDir, dstLeaf := dircache.SplitPath(dstRemote)
+		if dstLeaf == "" {
+			return nil, errors.New("sync-move destination must name an entry")
+		}
+		dstParentID, err := f.dirCache.FindDir(ctx, dstDir, false)
+		if err != nil {
+			return nil, err
+		}
+		if dstParentID == virtualRootID {
+			return nil, errors.New("sync-move cannot move entries directly into the PKU Disk virtual root")
+		}
+		srcParentID, ok := parentDocID(id)
+		if !ok {
+			return nil, fmt.Errorf("sync-move cannot derive the source parent from docid %q", id)
+		}
+
+		var newID string
+		if srcParentID == dstParentID {
+			if err := f.api.renameEntry(ctx, id, f.encodeName(dstLeaf), isDir); err != nil {
+				return nil, err
+			}
+			newID = id
+		} else {
+			newID, err = f.api.moveEntry(ctx, id, dstParentID, f.encodeName(dstLeaf), isDir)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if isDir {
+			// sync-move identifies the source directory by docid rather than by
+			// a reliable source remote path, so a targeted FlushDir is not safe.
+			// Drop all cached path->docid mappings after a successful directory
+			// relocation so later long-lived rcd operations cannot act on the
+			// moved directory through its stale old path.
+			f.dirCache.Flush()
+		}
+		return map[string]any{"id": newID, "remote": dstRemote}, nil
+	default:
+		return nil, fmt.Errorf("unknown PKU Disk backend command %q", name)
+	}
+}
+
 func (o *Object) Fs() fs.Info { return o.fs }
 func (o *Object) String() string {
 	if o == nil {
@@ -629,6 +761,14 @@ func (o *Object) Remote() string                    { return o.remote }
 func (o *Object) ModTime(context.Context) time.Time { return o.modTime }
 func (o *Object) Size() int64                       { return o.size }
 func (o *Object) Storable() bool                    { return true }
+func (o *Object) ID() string                        { return o.id }
+
+func (o *Object) Metadata(context.Context) (fs.Metadata, error) {
+	if o.rev == "" {
+		return nil, nil
+	}
+	return fs.Metadata{metadataRevisionKey: o.rev}, nil
+}
 
 func (o *Object) Hash(context.Context, hash.Type) (string, error) {
 	return "", hash.ErrUnsupported
@@ -638,7 +778,63 @@ func (o *Object) SetModTime(context.Context, time.Time) error {
 	return fs.ErrorCantSetModTime
 }
 
+type syncDownloadPreconditions struct {
+	expectedID  string
+	expectedRev string
+	set         bool
+}
+
+func extractSyncDownloadPreconditions(options []fs.OpenOption) (syncDownloadPreconditions, []fs.OpenOption, error) {
+	var p syncDownloadPreconditions
+	var idSet, revSet bool
+	forwarded := make([]fs.OpenOption, 0, len(options))
+	for _, option := range options {
+		header, ok := option.(*fs.HTTPOption)
+		if !ok {
+			forwarded = append(forwarded, option)
+			continue
+		}
+		key := strings.TrimSpace(header.Key)
+		switch {
+		case strings.EqualFold(key, syncExpectedIDDownloadHeader):
+			value := strings.TrimSpace(header.Value)
+			if value == "" {
+				return p, nil, syncPreconditionErrorf("%s must not be empty", syncExpectedIDDownloadHeader)
+			}
+			if idSet && p.expectedID != value {
+				return p, nil, syncPreconditionErrorf("conflicting %s values", syncExpectedIDDownloadHeader)
+			}
+			p.expectedID = value
+			idSet = true
+			continue
+		case strings.EqualFold(key, syncExpectedRevDownloadHeader):
+			value := strings.TrimSpace(header.Value)
+			if value == "" {
+				return p, nil, syncPreconditionErrorf("%s must not be empty", syncExpectedRevDownloadHeader)
+			}
+			if revSet && p.expectedRev != value {
+				return p, nil, syncPreconditionErrorf("conflicting %s values", syncExpectedRevDownloadHeader)
+			}
+			p.expectedRev = value
+			revSet = true
+			continue
+		default:
+			forwarded = append(forwarded, option)
+		}
+	}
+	if idSet != revSet {
+		return p, nil, syncPreconditionErrorf("%s and %s must be supplied together", syncExpectedIDDownloadHeader, syncExpectedRevDownloadHeader)
+	}
+	p.set = idSet
+	return p, forwarded, nil
+}
+
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	preconditions, forwarded, err := extractSyncDownloadPreconditions(options)
+	if err != nil {
+		return nil, err
+	}
+	options = forwarded
 	meta := fileMetadata{
 		DocID: o.id,
 		Name:  o.fs.encodeName(path.Base(o.remote)),
@@ -651,6 +847,14 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 			return nil, err
 		}
 		meta = fresh
+	}
+	if preconditions.set {
+		if meta.DocID != preconditions.expectedID {
+			return nil, syncPreconditionErrorf("remote object ID changed: expected %q, got %q", preconditions.expectedID, meta.DocID)
+		}
+		if meta.Rev != preconditions.expectedRev {
+			return nil, syncPreconditionErrorf("remote revision changed for %q: expected %q, got %q", meta.DocID, preconditions.expectedRev, meta.Rev)
+		}
 	}
 	signedURL, err := o.fs.api.downloadURL(ctx, meta)
 	if err != nil {
@@ -682,7 +886,100 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	return resp.Body, nil
 }
 
-func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ ...fs.OpenOption) error {
+type syncUploadPreconditions struct {
+	expectedID     string
+	expectedRev    string
+	expectedAbsent bool
+	set            bool
+}
+
+func syncPreconditionErrorf(format string, args ...any) error {
+	return fserrors.NoRetryError(fmt.Errorf("PKU Disk sync precondition failed: "+format, args...))
+}
+
+func extractSyncUploadPreconditions(options []fs.OpenOption) (syncUploadPreconditions, error) {
+	var p syncUploadPreconditions
+	var idSet, revSet, absentSet bool
+	for _, option := range options {
+		metadata, ok := option.(fs.MetadataOption)
+		if !ok {
+			continue
+		}
+		if value, ok := metadata[syncExpectedIDMetadataKey]; ok {
+			if value == "" {
+				return p, syncPreconditionErrorf("%s must not be empty", syncExpectedIDMetadataKey)
+			}
+			if idSet && p.expectedID != value {
+				return p, syncPreconditionErrorf("conflicting %s values", syncExpectedIDMetadataKey)
+			}
+			p.expectedID = value
+			idSet = true
+		}
+		if value, ok := metadata[syncExpectedRevMetadataKey]; ok {
+			if value == "" {
+				return p, syncPreconditionErrorf("%s must not be empty", syncExpectedRevMetadataKey)
+			}
+			if revSet && p.expectedRev != value {
+				return p, syncPreconditionErrorf("conflicting %s values", syncExpectedRevMetadataKey)
+			}
+			p.expectedRev = value
+			revSet = true
+		}
+		if value, ok := metadata[syncExpectedAbsentMetadataKey]; ok {
+			if !strings.EqualFold(strings.TrimSpace(value), "true") {
+				return p, syncPreconditionErrorf("%s must be true when supplied", syncExpectedAbsentMetadataKey)
+			}
+			p.expectedAbsent = true
+			absentSet = true
+		}
+	}
+	if idSet != revSet {
+		return p, syncPreconditionErrorf("%s and %s must be supplied together", syncExpectedIDMetadataKey, syncExpectedRevMetadataKey)
+	}
+	if absentSet && idSet {
+		return p, syncPreconditionErrorf("%s cannot be combined with %s/%s", syncExpectedAbsentMetadataKey, syncExpectedIDMetadataKey, syncExpectedRevMetadataKey)
+	}
+	p.set = idSet || absentSet
+	return p, nil
+}
+
+func (p syncUploadPreconditions) checkObject(id, rev string) error {
+	if !p.set {
+		return nil
+	}
+	if p.expectedAbsent {
+		if id != "" {
+			return syncPreconditionErrorf("remote object appeared: expected absent, got %q", id)
+		}
+		return nil
+	}
+	if id == "" {
+		return syncPreconditionErrorf("remote object disappeared: expected %q", p.expectedID)
+	}
+	if id != p.expectedID {
+		return syncPreconditionErrorf("remote object ID changed: expected %q, got %q", p.expectedID, id)
+	}
+	if rev != p.expectedRev {
+		return syncPreconditionErrorf("remote revision changed for %q: expected %q, got %q", id, p.expectedRev, rev)
+	}
+	return nil
+}
+
+func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	preconditions, err := extractSyncUploadPreconditions(options)
+	if err != nil {
+		return err
+	}
+	existingRev := o.rev
+	if preconditions.set {
+		if err := preconditions.checkObject(o.id, o.rev); err != nil {
+			return err
+		}
+		if !preconditions.expectedAbsent {
+			existingRev = preconditions.expectedRev
+		}
+	}
+
 	leaf, parentID, err := o.fs.dirCache.FindPath(ctx, o.remote, true)
 	if err != nil {
 		return err
@@ -690,8 +987,11 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ 
 	if parentID == virtualRootID {
 		return errors.New("files cannot be uploaded directly into the PKU Disk virtual root")
 	}
-	meta, err := o.fs.api.upload(ctx, parentID, o.fs.encodeName(leaf), o.id, o.rev, src.Size(), src.ModTime(ctx), in)
+	meta, err := o.fs.api.upload(ctx, parentID, o.fs.encodeName(leaf), o.id, existingRev, src.Size(), src.ModTime(ctx), in)
 	if err != nil {
+		if preconditions.set && isEditRevisionConflict(err) {
+			return syncPreconditionErrorf("remote revision changed while updating %q: %v", o.id, err)
+		}
 		return err
 	}
 	o.id = meta.DocID
@@ -717,5 +1017,8 @@ var (
 	_ fs.DirMover        = (*Fs)(nil)
 	_ fs.Purger          = (*Fs)(nil)
 	_ fs.OpenChunkWriter = (*Fs)(nil)
+	_ fs.Commander       = (*Fs)(nil)
 	_ fs.Object          = (*Object)(nil)
+	_ fs.IDer            = (*Object)(nil)
+	_ fs.Metadataer      = (*Object)(nil)
 )

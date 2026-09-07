@@ -25,6 +25,7 @@ const (
 	transientReadFastTimeout = 20 * time.Second
 	transientReadSlowTimeout = 60 * time.Second
 	transientRetryDelay      = 250 * time.Millisecond
+	editRevisionConflictCode = int64(403203)
 )
 
 var reauthenticationCodes = map[int64]struct{}{
@@ -127,6 +128,11 @@ func (e *apiError) Error() string {
 		return fmt.Sprintf("PKU Disk API error: HTTP %d, code %d: %s", e.Status, e.Code, e.Msg)
 	}
 	return fmt.Sprintf("PKU Disk API error: HTTP %d: %s", e.Status, e.Msg)
+}
+
+func isEditRevisionConflict(err error) bool {
+	var apiErr *apiError
+	return errors.As(err, &apiErr) && apiErr.Code == editRevisionConflictCode
 }
 
 func newAPIClient(ctx context.Context, baseURL string, tokens tokenProvider) (*apiClient, error) {

@@ -219,6 +219,41 @@ Interrupted `OpenChunkWriter` uploads are resumable across rclone process restar
 
 Downloads use signed AnyShare object-storage URLs and support rclone range requests. The backend also bundles the TrustAsia intermediate certificate needed on systems where the PKU object-storage endpoint does not serve that intermediate in its certificate chain.
 
+## Stateful sync integration contract
+
+The backend exposes a small set of internal safety controls for a stateful sync client. They are not needed for ordinary rclone CLI use.
+
+For local-to-PKU uploads, the caller must supply exactly one baseline precondition through per-call RC `_config.MetadataSet`:
+
+- existing destination: `pkudisk-sync-expected-id` plus `pkudisk-sync-expected-rev`;
+- destination absent at the committed baseline: `pkudisk-sync-expected-absent=true`.
+
+Existing-object updates use the supplied baseline revision as AnyShare `editedrev`; an ID/revision mismatch is a non-retryable sync conflict. Expected-absent creates reject an object that appeared since planning, while AnyShare `ondup=1` remains the final race guard if the destination is still absent at the backend precheck.
+
+`operations/copyfile` has rclone copy policy in front of the backend. RC `_config` starts from a shallow copy of the long-lived `rcd` configuration, so setting only `IgnoreTimes=true` is **not** enough: inherited policy such as `IgnoreExisting`, `CompareDest`, `CopyDest`, `BackupDir`, `Suffix`, `DryRun`, or `Interactive` can skip the transfer or mutate the destination before the backend precondition runs. A conditional-upload executor must use a policy-neutral `rcd` and explicitly reset the relevant per-call fields. The v1 safe profile is:
+
+```json
+{
+  "IgnoreTimes": true,
+  "IgnoreExisting": false,
+  "UpdateOlder": false,
+  "DryRun": false,
+  "Interactive": false,
+  "NoCheckDest": false,
+  "CompareDest": [],
+  "CopyDest": [],
+  "BackupDir": "",
+  "Suffix": "",
+  "Inplace": true
+}
+```
+
+`Inplace=true` makes the contract independent of rclone partial-file staging if the backend ever advertises partial uploads in the future. The sync daemon should own the `rcd` child, its argv/environment, config and cache; user copy-policy flags must not be inherited as daemon policy.
+
+For PKU-to-local conditional downloads, pass `X-PKUDisk-Sync-Expected-ID` and `X-PKUDisk-Sync-Expected-Rev` through per-call `_config.DownloadHeaders`, copy to a unique local temporary path, and set `_config.MultiThreadStreams=1`. rclone's multi-thread source chunk path does not propagate these download options, so multi-thread conditional downloads are deliberately disabled in v1.
+
+For destructive remote mutations, use the exact-ID backend commands rather than generic path-resolving operations: `sync-delete <docid> -o expected-rev=<rev>` and `sync-move <docid> <destination-remote>`. Directory `sync-move` flushes the backend directory cache after success.
+
 ## Current limitations
 
 Several optional rclone capabilities are not implemented yet:
