@@ -426,3 +426,141 @@ func TestOpenChunkWriterUsesExpectedRevisionForMultipartInit(t *testing.T) {
 		t.Fatalf("sync revision metadata leaked into multipart init: %#v", initBody)
 	}
 }
+
+func TestSyncDeleteCommandChecksRevisionBeforeExactIDDelete(t *testing.T) {
+	ctx := context.Background()
+	currentRev := "rev-current"
+	deleteCalls := 0
+	var deletedID string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/efast/v1/file/metadata":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"docid": body["docid"], "file_name": "file.txt", "size": 7, "rev": currentRev,
+			})
+		case "/api/efast/v1/file/delete":
+			deleteCalls++
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			deletedID, _ = body["docid"].(string)
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	f := &Fs{api: mustNewAPIClient(t, ctx, server.URL, &staticTokenProvider{token: "test-token"})}
+	id := "gns://personal/file"
+	_, err := f.Command(ctx, "sync-delete", []string{id}, map[string]string{"expected-rev": "rev-stale"})
+	if err == nil || !fserrors.IsNoRetryError(err) {
+		t.Fatalf("stale sync-delete error = %v, want NoRetryError", err)
+	}
+	if deleteCalls != 0 {
+		t.Fatalf("stale sync-delete performed %d delete calls", deleteCalls)
+	}
+
+	result, err := f.Command(ctx, "sync-delete", []string{id}, map[string]string{"expected-rev": currentRev})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleteCalls != 1 || deletedID != id {
+		t.Fatalf("sync-delete calls=%d id=%q, want one delete of %q", deleteCalls, deletedID, id)
+	}
+	got, ok := result.(map[string]any)
+	if !ok || got["deleted"] != true || got["id"] != id {
+		t.Fatalf("sync-delete result = %#v", result)
+	}
+}
+
+func TestSyncMoveCommandUsesExactID(t *testing.T) {
+	ctx := context.Background()
+	var renameBody map[string]any
+	var moveBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/efast/v1/file/rename":
+			_ = json.NewDecoder(r.Body).Decode(&renameBody)
+			_, _ = w.Write([]byte(`{}`))
+		case "/api/efast/v1/file/move":
+			_ = json.NewDecoder(r.Body).Decode(&moveBody)
+			_ = json.NewEncoder(w).Encode(map[string]any{"docid": "gns://personal/sub/file"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	f := &Fs{
+		opt: Options{Enc: defaultEncoding},
+		api: mustNewAPIClient(t, ctx, server.URL, &staticTokenProvider{token: "test-token"}),
+	}
+	f.dirCache = dircache.New("", virtualRootID, f)
+	if err := f.dirCache.FindRoot(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	f.dirCache.Put("Personal", "gns://personal")
+	f.dirCache.Put("Personal/Sub", "gns://personal/sub")
+	id := "gns://personal/file"
+
+	result, err := f.Command(ctx, "sync-move", []string{id, "Personal/renamed.txt"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if renameBody["docid"] != id || renameBody["name"] != "renamed.txt" || renameBody["ondup"] != float64(1) {
+		t.Fatalf("same-parent sync-move body = %#v", renameBody)
+	}
+	if got := result.(map[string]any)["id"]; got != id {
+		t.Fatalf("same-parent sync-move returned id %v, want %q", got, id)
+	}
+
+	result, err = f.Command(ctx, "sync-move", []string{id, "Personal/Sub/moved.txt"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if moveBody["docid"] != id || moveBody["destparent"] != "gns://personal/sub" || moveBody["new_name"] != "moved.txt" || moveBody["ondup"] != float64(1) {
+		t.Fatalf("cross-parent sync-move body = %#v", moveBody)
+	}
+	if got := result.(map[string]any)["id"]; got != "gns://personal/sub/file" {
+		t.Fatalf("cross-parent sync-move returned id %v", got)
+	}
+}
+
+func TestSyncMoveCommandDoesNotCreateMissingDestinationParent(t *testing.T) {
+	ctx := context.Background()
+	mutations := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/efast/v1/dir/list":
+			_ = json.NewEncoder(w).Encode(map[string]any{"dirs": []any{}, "files": []any{}})
+		case "/api/efast/v1/file/rename", "/api/efast/v1/file/move", "/api/efast/v1/dir/create":
+			mutations++
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	f := &Fs{
+		opt: Options{Enc: defaultEncoding},
+		api: mustNewAPIClient(t, ctx, server.URL, &staticTokenProvider{token: "test-token"}),
+	}
+	f.dirCache = dircache.New("", virtualRootID, f)
+	if err := f.dirCache.FindRoot(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	f.dirCache.Put("Personal", "gns://personal")
+	_, err := f.Command(ctx, "sync-move", []string{"gns://personal/file", "Personal/Missing/moved.txt"}, nil)
+	if err == nil {
+		t.Fatal("sync-move unexpectedly accepted a missing destination parent")
+	}
+	if mutations != 0 {
+		t.Fatalf("sync-move performed %d mutations while resolving a missing destination parent", mutations)
+	}
+}

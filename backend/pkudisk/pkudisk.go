@@ -63,6 +63,20 @@ func init() {
 		NewFs:        NewFs,
 		Config:       configureOAuth,
 		MetadataInfo: metadataInfo,
+		CommandHelp: []fs.CommandHelp{
+			{
+				Name:  "sync-delete",
+				Short: "Delete an exact file ID after checking its expected revision.",
+				Long:  "Low-level primitive for stateful sync clients. The single argument is the AnyShare docid; -o expected-rev=<rev> is required. This avoids re-resolving a path to a different object before deletion.",
+				Opts:  map[string]string{"expected-rev": "required AnyShare revision expected immediately before deletion"},
+			},
+			{
+				Name:  "sync-move",
+				Short: "Move or rename an exact AnyShare object ID.",
+				Long:  "Low-level primitive for stateful sync clients. Arguments are <docid> <destination-remote>. The destination parent must already exist. Use -o kind=dir for a directory; the default kind is file.",
+				Opts:  map[string]string{"kind": "entry kind: file (default) or dir"},
+			},
+		},
 		Options: []fs.Option{
 			{
 				Name:    "auth",
@@ -635,6 +649,85 @@ func (f *Fs) relocateEntry(ctx context.Context, id, srcParentID, dstParentID, sr
 	return newID, nil
 }
 
+func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (any, error) {
+	switch name {
+	case "sync-delete":
+		if len(arg) != 1 {
+			return nil, errors.New("sync-delete requires exactly one docid argument")
+		}
+		id := strings.TrimSpace(arg[0])
+		expectedRev := strings.TrimSpace(opt["expected-rev"])
+		if id == "" || expectedRev == "" {
+			return nil, errors.New("sync-delete requires a non-empty docid and -o expected-rev=<rev>")
+		}
+		meta, err := f.api.metadata(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if meta.DocID != "" && meta.DocID != id {
+			return nil, syncPreconditionErrorf("remote object ID changed: expected %q, got %q", id, meta.DocID)
+		}
+		if meta.Rev != expectedRev {
+			return nil, syncPreconditionErrorf("remote revision changed for %q: expected %q, got %q", id, expectedRev, meta.Rev)
+		}
+		if err := f.api.deleteEntry(ctx, id, false); err != nil {
+			return nil, err
+		}
+		return map[string]any{"deleted": true, "id": id}, nil
+
+	case "sync-move":
+		if len(arg) != 2 {
+			return nil, errors.New("sync-move requires <docid> <destination-remote>")
+		}
+		id := strings.TrimSpace(arg[0])
+		dstRemote := strings.Trim(strings.TrimSpace(arg[1]), "/")
+		if id == "" || dstRemote == "" {
+			return nil, errors.New("sync-move requires non-empty docid and destination-remote arguments")
+		}
+		kind := strings.ToLower(strings.TrimSpace(opt["kind"]))
+		isDir := false
+		switch kind {
+		case "", "file":
+		case "dir":
+			isDir = true
+		default:
+			return nil, fmt.Errorf("sync-move kind must be file or dir, got %q", kind)
+		}
+
+		dstDir, dstLeaf := dircache.SplitPath(dstRemote)
+		if dstLeaf == "" {
+			return nil, errors.New("sync-move destination must name an entry")
+		}
+		dstParentID, err := f.dirCache.FindDir(ctx, dstDir, false)
+		if err != nil {
+			return nil, err
+		}
+		if dstParentID == virtualRootID {
+			return nil, errors.New("sync-move cannot move entries directly into the PKU Disk virtual root")
+		}
+		srcParentID, ok := parentDocID(id)
+		if !ok {
+			return nil, fmt.Errorf("sync-move cannot derive the source parent from docid %q", id)
+		}
+
+		var newID string
+		if srcParentID == dstParentID {
+			if err := f.api.renameEntry(ctx, id, f.encodeName(dstLeaf), isDir); err != nil {
+				return nil, err
+			}
+			newID = id
+		} else {
+			newID, err = f.api.moveEntry(ctx, id, dstParentID, f.encodeName(dstLeaf), isDir)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return map[string]any{"id": newID, "remote": dstRemote}, nil
+	default:
+		return nil, fmt.Errorf("unknown PKU Disk backend command %q", name)
+	}
+}
+
 func (o *Object) Fs() fs.Info { return o.fs }
 func (o *Object) String() string {
 	if o == nil {
@@ -806,6 +899,7 @@ var (
 	_ fs.DirMover        = (*Fs)(nil)
 	_ fs.Purger          = (*Fs)(nil)
 	_ fs.OpenChunkWriter = (*Fs)(nil)
+	_ fs.Commander       = (*Fs)(nil)
 	_ fs.Object          = (*Object)(nil)
 	_ fs.IDer            = (*Object)(nil)
 	_ fs.Metadataer      = (*Object)(nil)
