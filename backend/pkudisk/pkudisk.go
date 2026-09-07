@@ -74,6 +74,11 @@ func init() {
 				Opts:  map[string]string{"expected-rev": "required AnyShare revision expected immediately before deletion"},
 			},
 			{
+				Name:  "sync-delete-dir",
+				Short: "Delete an exact directory ID only after observing it empty.",
+				Long:  "Low-level primitive for stateful sync clients. The single argument is the AnyShare directory docid. The backend lists that exact ID immediately before deletion and refuses non-empty directories. AnyShare does not expose an atomic only-if-empty directory-delete precondition, so callers must still observe the postcondition.",
+			},
+			{
 				Name:  "sync-move",
 				Short: "Move or rename an exact AnyShare object ID.",
 				Long:  "Low-level primitive for stateful sync clients. Arguments are <docid> <destination-remote>. The destination parent must already exist. Use -o kind=dir for a directory; the default kind is file.",
@@ -686,6 +691,32 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 		}
 		if err := f.api.deleteEntry(ctx, id, false); err != nil {
 			return nil, err
+		}
+		return map[string]any{"deleted": true, "id": id}, nil
+
+	case "sync-delete-dir":
+		if len(arg) != 1 {
+			return nil, errors.New("sync-delete-dir requires exactly one docid argument")
+		}
+		id := strings.TrimSpace(arg[0])
+		if id == "" {
+			return nil, errors.New("sync-delete-dir requires a non-empty docid")
+		}
+		if _, ok := parentDocID(id); !ok {
+			return nil, errors.New("sync-delete-dir refuses document-library or malformed docids")
+		}
+		listing, err := f.api.listDir(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if len(listing.Dirs) != 0 || len(listing.Files) != 0 {
+			return nil, syncPreconditionErrorf("remote directory %q is no longer empty", id)
+		}
+		if err := f.api.deleteEntry(ctx, id, true); err != nil {
+			return nil, err
+		}
+		if f.dirCache != nil {
+			f.dirCache.Flush()
 		}
 		return map[string]any{"deleted": true, "id": id}, nil
 
