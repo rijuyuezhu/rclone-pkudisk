@@ -18,6 +18,7 @@ import (
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/hash"
 	rclonelog "github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/lib/dircache"
@@ -38,14 +39,30 @@ const (
 		encoder.EncodeRightSpace |
 		encoder.EncodeRightPeriod |
 		encoder.EncodeInvalidUtf8
+
+	metadataRevisionKey        = "rev"
+	syncExpectedIDMetadataKey  = "pkudisk-sync-expected-id"
+	syncExpectedRevMetadataKey = "pkudisk-sync-expected-rev"
 )
+
+var metadataInfo = &fs.MetadataInfo{
+	System: map[string]fs.MetadataHelp{
+		metadataRevisionKey: {
+			Help:     "AnyShare revision identifier for optimistic concurrency.",
+			Type:     "string",
+			ReadOnly: true,
+		},
+	},
+	Help: "PKU Disk exposes the current AnyShare revision as read-only system metadata.",
+}
 
 func init() {
 	registerBackend(&fs.RegInfo{
-		Name:        "pkudisk",
-		Description: "Peking University PKU Disk (AnyShare)",
-		NewFs:       NewFs,
-		Config:      configureOAuth,
+		Name:         "pkudisk",
+		Description:  "Peking University PKU Disk (AnyShare)",
+		NewFs:        NewFs,
+		Config:       configureOAuth,
+		MetadataInfo: metadataInfo,
 		Options: []fs.Option{
 			{
 				Name:    "auth",
@@ -629,6 +646,14 @@ func (o *Object) Remote() string                    { return o.remote }
 func (o *Object) ModTime(context.Context) time.Time { return o.modTime }
 func (o *Object) Size() int64                       { return o.size }
 func (o *Object) Storable() bool                    { return true }
+func (o *Object) ID() string                        { return o.id }
+
+func (o *Object) Metadata(context.Context) (fs.Metadata, error) {
+	if o.rev == "" {
+		return nil, nil
+	}
+	return fs.Metadata{metadataRevisionKey: o.rev}, nil
+}
 
 func (o *Object) Hash(context.Context, hash.Type) (string, error) {
 	return "", hash.ErrUnsupported
@@ -682,7 +707,68 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	return resp.Body, nil
 }
 
-func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ ...fs.OpenOption) error {
+type syncUploadPreconditions struct {
+	expectedID  string
+	expectedRev string
+	set         bool
+}
+
+func syncPreconditionErrorf(format string, args ...any) error {
+	return fserrors.NoRetryError(fmt.Errorf("PKU Disk sync precondition failed: "+format, args...))
+}
+
+func extractSyncUploadPreconditions(options []fs.OpenOption) (syncUploadPreconditions, error) {
+	var p syncUploadPreconditions
+	var idSet, revSet bool
+	for _, option := range options {
+		metadata, ok := option.(fs.MetadataOption)
+		if !ok {
+			continue
+		}
+		if value, ok := metadata[syncExpectedIDMetadataKey]; ok {
+			if value == "" {
+				return p, syncPreconditionErrorf("%s must not be empty", syncExpectedIDMetadataKey)
+			}
+			if idSet && p.expectedID != value {
+				return p, syncPreconditionErrorf("conflicting %s values", syncExpectedIDMetadataKey)
+			}
+			p.expectedID = value
+			idSet = true
+		}
+		if value, ok := metadata[syncExpectedRevMetadataKey]; ok {
+			if value == "" {
+				return p, syncPreconditionErrorf("%s must not be empty", syncExpectedRevMetadataKey)
+			}
+			if revSet && p.expectedRev != value {
+				return p, syncPreconditionErrorf("conflicting %s values", syncExpectedRevMetadataKey)
+			}
+			p.expectedRev = value
+			revSet = true
+		}
+	}
+	if idSet != revSet {
+		return p, syncPreconditionErrorf("%s and %s must be supplied together", syncExpectedIDMetadataKey, syncExpectedRevMetadataKey)
+	}
+	p.set = idSet
+	return p, nil
+}
+
+func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	preconditions, err := extractSyncUploadPreconditions(options)
+	if err != nil {
+		return err
+	}
+	existingRev := o.rev
+	if preconditions.set {
+		if o.id != preconditions.expectedID {
+			return syncPreconditionErrorf("remote object ID changed: expected %q, got %q", preconditions.expectedID, o.id)
+		}
+		if o.rev != preconditions.expectedRev {
+			return syncPreconditionErrorf("remote revision changed for %q: expected %q, got %q", o.id, preconditions.expectedRev, o.rev)
+		}
+		existingRev = preconditions.expectedRev
+	}
+
 	leaf, parentID, err := o.fs.dirCache.FindPath(ctx, o.remote, true)
 	if err != nil {
 		return err
@@ -690,8 +776,11 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ 
 	if parentID == virtualRootID {
 		return errors.New("files cannot be uploaded directly into the PKU Disk virtual root")
 	}
-	meta, err := o.fs.api.upload(ctx, parentID, o.fs.encodeName(leaf), o.id, o.rev, src.Size(), src.ModTime(ctx), in)
+	meta, err := o.fs.api.upload(ctx, parentID, o.fs.encodeName(leaf), o.id, existingRev, src.Size(), src.ModTime(ctx), in)
 	if err != nil {
+		if preconditions.set && isEditRevisionConflict(err) {
+			return syncPreconditionErrorf("remote revision changed while updating %q: %v", o.id, err)
+		}
 		return err
 	}
 	o.id = meta.DocID
@@ -718,4 +807,6 @@ var (
 	_ fs.Purger          = (*Fs)(nil)
 	_ fs.OpenChunkWriter = (*Fs)(nil)
 	_ fs.Object          = (*Object)(nil)
+	_ fs.IDer            = (*Object)(nil)
+	_ fs.Metadataer      = (*Object)(nil)
 )

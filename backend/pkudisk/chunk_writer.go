@@ -22,14 +22,15 @@ const defaultUploadConcurrency = 4
 // range reads; this type only uploads independently-addressable parts and
 // finalizes the server-side multipart session.
 type pkudiskChunkWriter struct {
-	api         *apiClient
-	objectHTTP  *http.Client
-	init        multipartInit
-	existingRev string
-	size        int64
-	partSize    int64
-	partCount   int64
-	signedParts multipartSignedParts
+	api                *apiClient
+	objectHTTP         *http.Client
+	init               multipartInit
+	existingRev        string
+	syncPreconditioned bool
+	size               int64
+	partSize           int64
+	partCount          int64
+	signedParts        multipartSignedParts
 	// resumeSource is retained only for local sources. It lets completed-part
 	// verification read the current local bytes at WriteChunk time without
 	// consuming rclone's accounted transfer reader, so user-visible transferred
@@ -52,7 +53,11 @@ type pkudiskChunkWriter struct {
 
 // OpenChunkWriter starts an AnyShare multipart upload suitable for rclone's
 // generic multi-thread copy engine.
-func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectInfo, _ ...fs.OpenOption) (info fs.ChunkWriterInfo, writer fs.ChunkWriter, err error) {
+func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (info fs.ChunkWriterInfo, writer fs.ChunkWriter, err error) {
+	preconditions, err := extractSyncUploadPreconditions(options)
+	if err != nil {
+		return info, nil, err
+	}
 	size := src.Size()
 	if size <= 0 {
 		return info, nil, &fs.FileTooSmallError{MinSize: 1}
@@ -87,6 +92,18 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 	default:
 		return info, nil, existingErr
 	}
+	if preconditions.set {
+		if existingErr != nil {
+			return info, nil, syncPreconditionErrorf("remote object disappeared: expected %q", preconditions.expectedID)
+		}
+		if existingID != preconditions.expectedID {
+			return info, nil, syncPreconditionErrorf("remote object ID changed: expected %q, got %q", preconditions.expectedID, existingID)
+		}
+		if existingRev != preconditions.expectedRev {
+			return info, nil, syncPreconditionErrorf("remote revision changed for %q: expected %q, got %q", existingID, preconditions.expectedRev, existingRev)
+		}
+		existingRev = preconditions.expectedRev
+	}
 
 	partSize, err := f.api.multipartPartSize(ctx, size)
 	if err != nil {
@@ -103,6 +120,9 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 			size,
 			modTime,
 		), &fresh); err != nil {
+			if preconditions.set && isEditRevisionConflict(err) {
+				return multipartInit{}, syncPreconditionErrorf("remote revision changed while starting multipart update %q: %v", existingID, err)
+			}
 			return multipartInit{}, err
 		}
 		if fresh.DocID == "" || fresh.Rev == "" || fresh.UploadID == "" {
@@ -196,17 +216,18 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 	}
 
 	cw := &pkudiskChunkWriter{
-		api:         f.api,
-		objectHTTP:  f.api.objectHTTP,
-		init:        init,
-		existingRev: existingRev,
-		size:        size,
-		partSize:    partSize,
-		partCount:   partCount,
-		signedParts: signedParts,
-		partInfo:    partInfo,
-		resumeStore: resumeStore,
-		resumeState: state,
+		api:                f.api,
+		objectHTTP:         f.api.objectHTTP,
+		init:               init,
+		existingRev:        existingRev,
+		syncPreconditioned: preconditions.set,
+		size:               size,
+		partSize:           partSize,
+		partCount:          partCount,
+		signedParts:        signedParts,
+		partInfo:           partInfo,
+		resumeStore:        resumeStore,
+		resumeState:        state,
 	}
 	if sourceFs := src.Fs(); sourceFs != nil && sourceFs.Features().IsLocal {
 		if obj, ok := src.(fs.Object); ok {
@@ -374,6 +395,9 @@ func (w *pkudiskChunkWriter) Close(ctx context.Context) error {
 
 	_, err := w.api.finishMultipartUpload(ctx, w.init, w.existingRev, partInfo, w.objectHTTP)
 	if err != nil {
+		if w.syncPreconditioned && isEditRevisionConflict(err) {
+			err = syncPreconditionErrorf("remote revision changed while finalizing multipart update %q: %v", w.init.DocID, err)
+		}
 		// Once finalization starts, a failure can be ambiguous: the object
 		// store may already have consumed the multipart upload ID while the
 		// AnyShare osendupload step did not finish. Do not carry that state into
