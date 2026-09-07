@@ -93,16 +93,12 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		return info, nil, existingErr
 	}
 	if preconditions.set {
-		if existingErr != nil {
-			return info, nil, syncPreconditionErrorf("remote object disappeared: expected %q", preconditions.expectedID)
+		if err := preconditions.checkObject(existingID, existingRev); err != nil {
+			return info, nil, err
 		}
-		if existingID != preconditions.expectedID {
-			return info, nil, syncPreconditionErrorf("remote object ID changed: expected %q, got %q", preconditions.expectedID, existingID)
+		if !preconditions.expectedAbsent {
+			existingRev = preconditions.expectedRev
 		}
-		if existingRev != preconditions.expectedRev {
-			return info, nil, syncPreconditionErrorf("remote revision changed for %q: expected %q, got %q", existingID, preconditions.expectedRev, existingRev)
-		}
-		existingRev = preconditions.expectedRev
 	}
 
 	partSize, err := f.api.multipartPartSize(ctx, size)

@@ -43,6 +43,7 @@ const (
 	metadataRevisionKey           = "rev"
 	syncExpectedIDMetadataKey     = "pkudisk-sync-expected-id"
 	syncExpectedRevMetadataKey    = "pkudisk-sync-expected-rev"
+	syncExpectedAbsentMetadataKey = "pkudisk-sync-expected-absent"
 	syncExpectedIDDownloadHeader  = "X-PKUDisk-Sync-Expected-ID"
 	syncExpectedRevDownloadHeader = "X-PKUDisk-Sync-Expected-Rev"
 )
@@ -418,12 +419,23 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	remote := src.Remote()
+	preconditions, err := extractSyncUploadPreconditions(options)
+	if err != nil {
+		return nil, err
+	}
 	if existing, err := f.NewObject(ctx, remote); err == nil {
+		o := existing.(*Object)
+		if err := preconditions.checkObject(o.id, o.rev); err != nil {
+			return nil, err
+		}
 		if err := existing.Update(ctx, in, src, options...); err != nil {
 			return nil, err
 		}
 		return existing, nil
 	} else if !errors.Is(err, fs.ErrorObjectNotFound) {
+		return nil, err
+	}
+	if err := preconditions.checkObject("", ""); err != nil {
 		return nil, err
 	}
 
@@ -724,6 +736,14 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 				return nil, err
 			}
 		}
+		if isDir {
+			// sync-move identifies the source directory by docid rather than by
+			// a reliable source remote path, so a targeted FlushDir is not safe.
+			// Drop all cached path->docid mappings after a successful directory
+			// relocation so later long-lived rcd operations cannot act on the
+			// moved directory through its stale old path.
+			f.dirCache.Flush()
+		}
 		return map[string]any{"id": newID, "remote": dstRemote}, nil
 	default:
 		return nil, fmt.Errorf("unknown PKU Disk backend command %q", name)
@@ -867,9 +887,10 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 }
 
 type syncUploadPreconditions struct {
-	expectedID  string
-	expectedRev string
-	set         bool
+	expectedID     string
+	expectedRev    string
+	expectedAbsent bool
+	set            bool
 }
 
 func syncPreconditionErrorf(format string, args ...any) error {
@@ -878,7 +899,7 @@ func syncPreconditionErrorf(format string, args ...any) error {
 
 func extractSyncUploadPreconditions(options []fs.OpenOption) (syncUploadPreconditions, error) {
 	var p syncUploadPreconditions
-	var idSet, revSet bool
+	var idSet, revSet, absentSet bool
 	for _, option := range options {
 		metadata, ok := option.(fs.MetadataOption)
 		if !ok {
@@ -904,12 +925,44 @@ func extractSyncUploadPreconditions(options []fs.OpenOption) (syncUploadPrecondi
 			p.expectedRev = value
 			revSet = true
 		}
+		if value, ok := metadata[syncExpectedAbsentMetadataKey]; ok {
+			if !strings.EqualFold(strings.TrimSpace(value), "true") {
+				return p, syncPreconditionErrorf("%s must be true when supplied", syncExpectedAbsentMetadataKey)
+			}
+			p.expectedAbsent = true
+			absentSet = true
+		}
 	}
 	if idSet != revSet {
 		return p, syncPreconditionErrorf("%s and %s must be supplied together", syncExpectedIDMetadataKey, syncExpectedRevMetadataKey)
 	}
-	p.set = idSet
+	if absentSet && idSet {
+		return p, syncPreconditionErrorf("%s cannot be combined with %s/%s", syncExpectedAbsentMetadataKey, syncExpectedIDMetadataKey, syncExpectedRevMetadataKey)
+	}
+	p.set = idSet || absentSet
 	return p, nil
+}
+
+func (p syncUploadPreconditions) checkObject(id, rev string) error {
+	if !p.set {
+		return nil
+	}
+	if p.expectedAbsent {
+		if id != "" {
+			return syncPreconditionErrorf("remote object appeared: expected absent, got %q", id)
+		}
+		return nil
+	}
+	if id == "" {
+		return syncPreconditionErrorf("remote object disappeared: expected %q", p.expectedID)
+	}
+	if id != p.expectedID {
+		return syncPreconditionErrorf("remote object ID changed: expected %q, got %q", p.expectedID, id)
+	}
+	if rev != p.expectedRev {
+		return syncPreconditionErrorf("remote revision changed for %q: expected %q, got %q", id, p.expectedRev, rev)
+	}
+	return nil
 }
 
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
@@ -919,13 +972,12 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 	existingRev := o.rev
 	if preconditions.set {
-		if o.id != preconditions.expectedID {
-			return syncPreconditionErrorf("remote object ID changed: expected %q, got %q", preconditions.expectedID, o.id)
+		if err := preconditions.checkObject(o.id, o.rev); err != nil {
+			return err
 		}
-		if o.rev != preconditions.expectedRev {
-			return syncPreconditionErrorf("remote revision changed for %q: expected %q, got %q", o.id, preconditions.expectedRev, o.rev)
+		if !preconditions.expectedAbsent {
+			existingRev = preconditions.expectedRev
 		}
-		existingRev = preconditions.expectedRev
 	}
 
 	leaf, parentID, err := o.fs.dirCache.FindPath(ctx, o.remote, true)

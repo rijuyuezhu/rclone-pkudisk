@@ -86,6 +86,32 @@ func TestExtractSyncUploadPreconditions(t *testing.T) {
 			}},
 		},
 		{
+			name: "expected absent",
+			options: []fs.OpenOption{fs.MetadataOption{
+				syncExpectedAbsentMetadataKey: "true",
+			}},
+			want: syncUploadPreconditions{
+				expectedAbsent: true,
+				set:            true,
+			},
+		},
+		{
+			name: "expected absent must be true",
+			options: []fs.OpenOption{fs.MetadataOption{
+				syncExpectedAbsentMetadataKey: "false",
+			}},
+			wantError: true,
+		},
+		{
+			name: "expected absent conflicts with expected object",
+			options: []fs.OpenOption{fs.MetadataOption{
+				syncExpectedAbsentMetadataKey: "true",
+				syncExpectedIDMetadataKey:     "gns://personal/file",
+				syncExpectedRevMetadataKey:    "rev-a",
+			}},
+			wantError: true,
+		},
+		{
 			name: "missing revision",
 			options: []fs.OpenOption{fs.MetadataOption{
 				syncExpectedIDMetadataKey: "gns://personal/file",
@@ -273,6 +299,13 @@ func TestUpdateRejectsStaleSyncPreconditionsBeforeIO(t *testing.T) {
 			meta: fs.MetadataOption{
 				syncExpectedIDMetadataKey:  "gns://personal/file",
 				syncExpectedRevMetadataKey: "rev-a",
+			},
+		},
+		{
+			name: "expected absent but object exists",
+			o:    &Object{id: "gns://personal/file", rev: "rev-a"},
+			meta: fs.MetadataOption{
+				syncExpectedAbsentMetadataKey: "true",
 			},
 		},
 	}
@@ -482,6 +515,96 @@ func TestOpenChunkWriterRejectsStaleSyncPreconditionsBeforeMultipartIO(t *testin
 	}
 }
 
+func TestOpenChunkWriterRejectsExpectedAbsentWhenDestinationExists(t *testing.T) {
+	ctx := context.Background()
+	unexpectedCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/efast/v1/file/getinfobypath":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"docid": "gns://personal/concurrent", "name": "file.bin", "size": 3,
+				"rev": "rev-current", "client_mtime": int64(1_000_000),
+			})
+		default:
+			unexpectedCalls++
+			http.Error(w, `{"code":500001,"message":"unexpected call"}`, http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	f := &Fs{
+		name:      "pku",
+		opt:       Options{Enc: defaultEncoding},
+		api:       mustNewAPIClient(t, ctx, server.URL, &staticTokenProvider{token: "test-token"}),
+		resumeDir: t.TempDir(),
+	}
+	f.dirCache = dircache.New("", virtualRootID, f)
+	if err := f.dirCache.FindRoot(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	f.dirCache.Put("Personal", "gns://personal")
+	localRoot := t.TempDir()
+	writeRepeatedTestFile(t, filepath.Join(localRoot, "source.bin"), 'x', 7, time.Unix(2, 0))
+	src := newResumeLocalObject(t, ctx, localRoot, "source.bin")
+
+	_, _, err := f.OpenChunkWriter(ctx, "Personal/file.bin", src, fs.MetadataOption{
+		syncExpectedAbsentMetadataKey: "true",
+	})
+	if err == nil || !fserrors.IsNoRetryError(err) || !strings.Contains(err.Error(), "remote object appeared") {
+		t.Fatalf("expected-absent multipart error = %v, want sync NoRetryError", err)
+	}
+	if unexpectedCalls != 0 {
+		t.Fatalf("expected-absent multipart performed %d upload API calls", unexpectedCalls)
+	}
+}
+
+func TestPutRejectsExpectedAbsentWhenDestinationAppeared(t *testing.T) {
+	ctx := context.Background()
+	uploadCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/efast/v1/dir/list":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"dirs": []any{},
+				"files": []map[string]any{{
+					"docid": "gns://personal/concurrent", "name": "file.txt", "size": 3,
+					"rev": "rev-concurrent", "client_mtime": int64(1_000_000),
+				}},
+			})
+		case "/api/efast/v1/file/osbeginupload", "/api/efast/v1/file/osinitmultiupload":
+			uploadCalls++
+			http.Error(w, `{"code":500001,"message":"unexpected upload"}`, http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	f := &Fs{
+		name: "pku",
+		opt:  Options{Enc: defaultEncoding},
+		api:  mustNewAPIClient(t, ctx, server.URL, &staticTokenProvider{token: "test-token"}),
+	}
+	f.dirCache = dircache.New("", virtualRootID, f)
+	if err := f.dirCache.FindRoot(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	f.dirCache.Put("Personal", "gns://personal")
+	src := object.NewStaticObjectInfo("Personal/file.txt", time.Unix(2, 0), 7, true, nil, f)
+
+	_, err := f.Put(ctx, strings.NewReader("created"), src, fs.MetadataOption{
+		syncExpectedAbsentMetadataKey: "true",
+	})
+	if err == nil || !fserrors.IsNoRetryError(err) || !strings.Contains(err.Error(), "remote object appeared") {
+		t.Fatalf("expected-absent Put error = %v, want sync NoRetryError", err)
+	}
+	if uploadCalls != 0 {
+		t.Fatalf("expected-absent Put performed %d upload calls", uploadCalls)
+	}
+}
+
 func TestOpenChunkWriterUsesExpectedRevisionForMultipartInit(t *testing.T) {
 	ctx := context.Background()
 	var initBody map[string]any
@@ -682,5 +805,48 @@ func TestSyncMoveCommandDoesNotCreateMissingDestinationParent(t *testing.T) {
 	}
 	if mutations != 0 {
 		t.Fatalf("sync-move performed %d mutations while resolving a missing destination parent", mutations)
+	}
+}
+
+func TestSyncMoveDirectoryFlushesStaleDirCache(t *testing.T) {
+	ctx := context.Background()
+	id := "gns://personal/A"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/api/efast/v1/dir/rename" {
+			http.NotFound(w, r)
+			return
+		}
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body["docid"] != id || body["name"] != "B" || body["ondup"] != float64(1) {
+			t.Fatalf("unexpected directory rename body: %#v", body)
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	f := &Fs{
+		opt: Options{Enc: defaultEncoding},
+		api: mustNewAPIClient(t, ctx, server.URL, &staticTokenProvider{token: "test-token"}),
+	}
+	f.dirCache = dircache.New("", virtualRootID, f)
+	if err := f.dirCache.FindRoot(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	f.dirCache.Put("Personal", "gns://personal")
+	f.dirCache.Put("Personal/A", id)
+	if got, ok := f.dirCache.Get("Personal/A"); !ok || got != id {
+		t.Fatalf("precondition cache Personal/A = %q, %v", got, ok)
+	}
+
+	if _, err := f.Command(ctx, "sync-move", []string{id, "Personal/B"}, map[string]string{"kind": "dir"}); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := f.dirCache.Get("Personal/A"); ok {
+		t.Fatalf("stale source directory remained cached as Personal/A -> %q", got)
+	}
+	if got, ok := f.dirCache.Get("Personal/B"); ok {
+		t.Fatalf("destination directory was unexpectedly cached without revalidation: Personal/B -> %q", got)
 	}
 }
