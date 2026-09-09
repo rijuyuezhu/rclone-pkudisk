@@ -183,3 +183,122 @@ func TestOAuthTokenProvidersSerializeRotatingRefresh(t *testing.T) {
 		t.Fatalf("refresh calls = %d, want exactly 1", got)
 	}
 }
+
+func TestOAuthTokenProvidersForceRefreshAfterServerRejection(t *testing.T) {
+	var refreshCalls atomic.Int32
+	var lineageMu sync.Mutex
+	currentRefresh := "refresh-0"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth2/token":
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			refreshCalls.Add(1)
+			time.Sleep(50 * time.Millisecond)
+
+			lineageMu.Lock()
+			defer lineageMu.Unlock()
+			if got := r.Form.Get("refresh_token"); got != currentRefresh {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid_grant"})
+				return
+			}
+			currentRefresh = "refresh-1"
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"access_token":  "access-1",
+				"refresh_token": currentRefresh,
+				"token_type":    "bearer",
+				"expires_in":    3600,
+			})
+		case "/api/probe":
+			w.Header().Set("Content-Type", "application/json")
+			switch r.Header.Get("Authorization") {
+			case "Bearer access-0":
+				w.WriteHeader(http.StatusUnauthorized)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"code":    401001001,
+					"message": "access token rejected",
+				})
+			case "Bearer access-1":
+				_, _ = w.Write([]byte(`{"ok":true}`))
+			default:
+				w.WriteHeader(http.StatusUnauthorized)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	// The key regression condition is a token that is still locally valid but
+	// has already been rejected by the server.
+	initial := &oauth2.Token{
+		AccessToken:  "access-0",
+		RefreshToken: "refresh-0",
+		TokenType:    "bearer",
+		Expiry:       time.Now().Add(time.Hour),
+	}
+	rawToken, err := json.Marshal(initial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &lockedOAuthConfig{values: map[string]string{config.ConfigToken: string(rawToken)}}
+	oauthConfig := &oauthutil.Config{
+		ClientID:     "client-id",
+		ClientSecret: "client-secret",
+		AuthURL:      server.URL + "/oauth2/auth",
+		TokenURL:     server.URL + "/oauth2/token",
+		AuthStyle:    oauth2.AuthStyleInHeader,
+	}
+	_, sourceA, err := oauthutil.NewClient(context.Background(), "pkudisk", m, oauthConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, sourceB, err := oauthutil.NewClient(context.Background(), "pkudisk", m, oauthConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clients := make([]*apiClient, 0, 2)
+	for _, source := range []*oauthutil.TokenSource{sourceA, sourceB} {
+		client, err := newAPIClient(context.Background(), server.URL, &oauthTokenProvider{source: source})
+		if err != nil {
+			t.Fatal(err)
+		}
+		clients = append(clients, client)
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, len(clients))
+	var wg sync.WaitGroup
+	for _, client := range clients {
+		wg.Add(1)
+		go func(client *apiClient) {
+			defer wg.Done()
+			<-start
+			_, err := client.do(context.Background(), http.MethodGet, "probe", nil)
+			errs <- err
+		}(client)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("refresh calls = %d, want exactly 1", got)
+	}
+	persisted, err := oauthutil.GetToken("pkudisk", m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.AccessToken != "access-1" || persisted.RefreshToken != "refresh-1" {
+		t.Fatalf("persisted token lineage = access %q refresh %q, want access-1/refresh-1", persisted.AccessToken, persisted.RefreshToken)
+	}
+}
