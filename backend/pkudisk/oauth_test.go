@@ -3,15 +3,38 @@ package pkudisk
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/lib/oauthutil"
+	"golang.org/x/oauth2"
 )
+
+type lockedOAuthConfig struct {
+	mu     sync.Mutex
+	values map[string]string
+}
+
+func (m *lockedOAuthConfig) Get(key string) (string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	value, ok := m.values[key]
+	return value, ok
+}
+
+func (m *lockedOAuthConfig) Set(key, value string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.values[key] = value
+}
 
 func TestConfigureOAuthRegistersOnce(t *testing.T) {
 	var calls atomic.Int32
@@ -64,5 +87,99 @@ func TestConfigureOAuthRegistersOnce(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("registration calls = %d, want 1", calls.Load())
+	}
+}
+
+func TestOAuthTokenProvidersSerializeRotatingRefresh(t *testing.T) {
+	var refreshCalls atomic.Int32
+	var lineageMu sync.Mutex
+	currentRefresh := "refresh-0"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/oauth2/token" {
+			http.NotFound(w, r)
+			return
+		}
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		refreshCalls.Add(1)
+		// Widen the race window: without process-wide token serialization,
+		// independent sources both submit refresh-0 before either can persist
+		// the rotated token.
+		time.Sleep(50 * time.Millisecond)
+
+		lineageMu.Lock()
+		defer lineageMu.Unlock()
+		if got := r.Form.Get("refresh_token"); got != currentRefresh {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid_grant"})
+			return
+		}
+		currentRefresh = "refresh-1"
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  "access-1",
+			"refresh_token": currentRefresh,
+			"token_type":    "bearer",
+			"expires_in":    3600,
+		})
+	}))
+	defer server.Close()
+
+	initial := &oauth2.Token{
+		AccessToken:  "access-0",
+		RefreshToken: "refresh-0",
+		TokenType:    "bearer",
+		Expiry:       time.Now().Add(-time.Hour),
+	}
+	rawToken, err := json.Marshal(initial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &lockedOAuthConfig{values: map[string]string{config.ConfigToken: string(rawToken)}}
+	oauthConfig := &oauthutil.Config{
+		ClientID:     "client-id",
+		ClientSecret: "client-secret",
+		AuthURL:      server.URL + "/oauth2/auth",
+		TokenURL:     server.URL + "/oauth2/token",
+		AuthStyle:    oauth2.AuthStyleInHeader,
+	}
+	_, sourceA, err := oauthutil.NewClient(context.Background(), "pkudisk", m, oauthConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, sourceB, err := oauthutil.NewClient(context.Background(), "pkudisk", m, oauthConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	providers := []*oauthTokenProvider{{source: sourceA}, {source: sourceB}}
+
+	start := make(chan struct{})
+	errs := make(chan error, len(providers))
+	var wg sync.WaitGroup
+	for _, provider := range providers {
+		wg.Add(1)
+		go func(provider *oauthTokenProvider) {
+			defer wg.Done()
+			<-start
+			token, err := provider.Token(context.Background(), false)
+			if err == nil && token != "access-1" {
+				err = fmt.Errorf("access token = %q, want access-1", token)
+			}
+			errs <- err
+		}(provider)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("refresh calls = %d, want exactly 1", got)
 	}
 }

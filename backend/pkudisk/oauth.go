@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rclone/rclone/fs"
@@ -21,11 +22,22 @@ import (
 
 const oauthScope = "offline openid all"
 
+// oauthTokenMu serializes access to all in-process OAuth token sources. Each
+// PKU Disk Fs has its own oauthutil.TokenSource, but those sources persist to
+// the same remote config and PKU Disk rotates refresh tokens. Serialization is
+// required even for refresh=false: TokenSource.Token itself may refresh an
+// expired token. Once one source rotates and persists the token, the next
+// source enters rclone's reReadToken path and adopts that fresh lineage instead
+// of submitting the already-consumed refresh token.
+var oauthTokenMu sync.Mutex
+
 type oauthTokenProvider struct {
 	source *oauthutil.TokenSource
 }
 
 func (p *oauthTokenProvider) Token(_ context.Context, refresh bool) (string, error) {
+	oauthTokenMu.Lock()
+	defer oauthTokenMu.Unlock()
 	if refresh {
 		p.source.Invalidate()
 	}
