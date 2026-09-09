@@ -39,7 +39,15 @@ func (p *oauthTokenProvider) Token(_ context.Context, refresh bool) (string, err
 	oauthTokenMu.Lock()
 	defer oauthTokenMu.Unlock()
 	if refresh {
-		p.source.Invalidate()
+		// A server-side auth rejection is stronger evidence than the local
+		// expiry timestamp. Persistently expire this source's rejected token so
+		// rclone cannot immediately re-read the same still-locally-valid token
+		// from config. If another source refreshed while we waited for
+		// oauthTokenMu, Expire leaves that different access token untouched and
+		// Token adopts the fresh persisted lineage instead.
+		if err := p.source.Expire(); err != nil {
+			return "", err
+		}
 	}
 	token, err := p.source.Token()
 	if err != nil {
